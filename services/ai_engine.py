@@ -37,6 +37,50 @@ class AIEngine:
                 logger.error(f"Ошибка при инициализации Gemini Client: {e}")
                 self.client = None
 
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        """
+        Транскрибирует аудиофайл в текст, используя Gemini.
+
+        Args:
+            file_bytes (bytes): Содержимое аудиофайла.
+
+        Returns:
+            str: Расшифрованный текст.
+        """
+        if not self.client:
+            return "Ошибка: API ключ не настроен."
+
+        try:
+            # Создаем объект Part из байтов аудио
+            # Для Telegram voice messages формат обычно OGG (Opus)
+            # Gemini поддерживает audio/ogg
+            audio_part = types.Part.from_bytes(data=file_bytes, mime_type="audio/ogg")
+
+            # Отправляем запрос только на транскрибацию
+            prompt = "Пожалуйста, дословно транскрибируй этот аудиофайл в текст. Если аудио пустое или неразборчивое, напиши '[Не удалось распознать речь]'."
+
+            response = await self.client.aio.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=prompt),
+                            audio_part
+                        ]
+                    )
+                ]
+            )
+
+            if response.text:
+                return response.text.strip()
+            else:
+                return "[Не удалось распознать речь]"
+
+        except Exception as e:
+            logger.error(f"Ошибка при транскрибации аудио: {e}")
+            return "[Ошибка обработки аудио]"
+
     async def generate_response(self, user_id: int, user_text: str, history: list) -> str:
         """
         Генерирует ответ с использованием модели Gemini 1.5 Pro.
