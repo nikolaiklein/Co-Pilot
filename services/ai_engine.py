@@ -81,6 +81,44 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return "[Ошибка обработки аудио]"
 
+    async def analyze_content(self, prompt: str) -> str:
+        """
+        Анализирует контент на основе переданного промпта без истории чата.
+
+        Args:
+            prompt (str): Промпт для анализа.
+
+        Returns:
+            str: Результат анализа.
+        """
+        if not self.client:
+            return "Ошибка: API ключ не настроен."
+
+        try:
+            # Для анализа не нужна системная инструкция "биографа",
+            # так как мы явно задаем задачу в промпте.
+            # Но можно оставить дефолтную или переопределить.
+            # Для простоты используем generate_content с промптом как user message.
+
+            response = await self.client.aio.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(text=prompt)]
+                    )
+                ]
+            )
+
+            if response.text:
+                return response.text.strip()
+            else:
+                return "[Не удалось получить результат анализа]"
+
+        except Exception as e:
+            logger.error(f"Ошибка при анализе контента: {e}")
+            return f"[Ошибка анализа: {e}]"
+
     async def generate_response(self, user_id: int, user_text: str, history: list) -> str:
         """
         Генерирует ответ с использованием модели Gemini 1.5 Pro.

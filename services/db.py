@@ -131,3 +131,45 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Ошибка при получении истории сообщений для {user_id}: {e}")
             return []
+
+    async def update_user(self, user_id: int, data: dict):
+        """
+        Обновляет поля документа пользователя.
+
+        Args:
+            user_id (int): Telegram User ID.
+            data (dict): Словарь с обновляемыми полями.
+        """
+        if not self.db:
+             raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            user_ref = self.db.collection('users').document(str(user_id))
+            # update обновляет только указанные поля, не перезаписывая весь документ
+            await user_ref.update(data)
+            logger.info(f"Пользователь {user_id} обновлен.")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении пользователя {user_id}: {e}")
+            # Возможно, стоит кидать исключение, если обновление критично
+            pass
+
+    async def save_report(self, user_id: int, report_data: dict):
+        """
+        Сохраняет отчет анализа в подколлекцию 'reports' документа пользователя.
+
+        Args:
+            user_id (int): Telegram User ID.
+            report_data (dict): Данные отчета (анализ, дата и т.д.).
+        """
+        if not self.db:
+             raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            reports_ref = self.db.collection('users').document(str(user_id)).collection('reports')
+            # Добавляем timestamp сервера
+            report_data['timestamp'] = firestore.SERVER_TIMESTAMP
+            await reports_ref.add(report_data)
+            logger.info(f"Отчет для пользователя {user_id} сохранен.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении отчета для {user_id}: {e}")
+            pass

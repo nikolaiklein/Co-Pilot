@@ -7,6 +7,7 @@ from config.firebase_init import init_firebase
 from services.db import DatabaseService
 from services.telegram_bot import create_bot_app
 from services.ai_engine import AIEngine
+from services.analyzer import AnalyzerService
 
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +29,7 @@ app = FastAPI(
 db_service = None
 bot_app = None
 ai_engine = None
+analyzer_service = None
 
 # Событие запуска приложения
 @app.on_event("startup")
@@ -36,7 +38,7 @@ async def startup_event():
     Выполняется при старте приложения.
     Здесь происходит инициализация внешних сервисов: Firebase, DB, AI, Bot.
     """
-    global db_service, bot_app, ai_engine
+    global db_service, bot_app, ai_engine, analyzer_service
     logger.info("Запуск приложения...")
 
     # 1. Инициализация Firebase Admin
@@ -72,6 +74,16 @@ async def startup_event():
              logger.warning("Bot Application не создано (возможно, нет токена).")
     except Exception as e:
         logger.error(f"Ошибка инициализации бота: {e}")
+
+    # 5. Инициализация Analyzer Service
+    try:
+        if db_service and ai_engine:
+            analyzer_service = AnalyzerService(db_service, ai_engine)
+            logger.info("Analyzer Service инициализирован.")
+        else:
+            logger.warning("Analyzer Service не инициализирован (отсутствуют зависимости).")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Analyzer Service: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -126,6 +138,23 @@ async def telegram_webhook(request: Request):
         logger.error(f"Ошибка при обработке вебхука: {e}")
         # Возвращаем 200 OK даже при ошибке, чтобы Telegram не слал повторные запросы бесконечно
         return {"status": "error", "message": str(e)}
+
+@app.post("/cron/analyze")
+async def analyze_user_cron(user_id: int):
+    """
+    Эндпоинт для запуска анализа профиля пользователя по расписанию.
+    Cloud Scheduler должен делать POST запрос сюда с параметром user_id.
+
+    Args:
+        user_id (int): ID пользователя для анализа.
+
+    Returns:
+        dict: Результат анализа.
+    """
+    if not analyzer_service:
+        return {"status": "error", "message": "Analyzer Service not initialized"}
+
+    return await analyzer_service.analyze_user_profile(user_id)
 
 if __name__ == "__main__":
     # Этот блок используется только для локальной отладки при прямом запуске файла python main.py
