@@ -1,7 +1,7 @@
 import os
 import logging
 import io
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram import Update
 from services.db import DatabaseService
 
@@ -130,6 +130,64 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
             except Exception as e:
                 logger.error(f"Ошибка при обработке голосового сообщения от {user.id}: {e}")
                 await update.message.reply_text("Не удалось обработать голосовое сообщение.")
+
+        async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /start.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /start от {user.id}")
+            
+            # Создаем или получаем пользователя
+            user_data = {
+                "id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "language_code": user.language_code,
+                "is_bot": user.is_bot
+            }
+            await db_service.get_or_create_user(user.id, user_data)
+            
+            welcome_message = f"Привет, {user.first_name}! 👋\n\nЯ ваш AI-ассистент. Напишите мне что-нибудь, и я постараюсь помочь!"
+            await update.message.reply_text(welcome_message)
+
+        # Регистрируем обработчик команды /start
+        application.add_handler(CommandHandler("start", handle_start))
+
+        async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /help.
+            """
+            help_text = """📚 **Список команд:**
+
+/start — начать работу с ботом
+/help — показать это сообщение
+/clear — очистить историю диалога
+
+💬 Просто напишите мне сообщение, и я постараюсь помочь!
+🎤 Также вы можете отправить голосовое сообщение."""
+            await update.message.reply_text(help_text)
+
+        # Регистрируем обработчик команды /help
+        application.add_handler(CommandHandler("help", handle_help))
+
+        async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /clear — очищает историю диалога.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /clear от {user.id}")
+            
+            try:
+                count = await db_service.clear_messages(user.id)
+                await update.message.reply_text(f"✅ История очищена! Удалено сообщений: {count}")
+            except Exception as e:
+                logger.error(f"Ошибка очистки истории для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось очистить историю.")
+
+        # Регистрируем обработчик команды /clear
+        application.add_handler(CommandHandler("clear", handle_clear))
 
         # Регистрируем обработчик текстовых сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -173,3 +173,31 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Ошибка при сохранении отчета для {user_id}: {e}")
             pass
+
+    async def clear_messages(self, user_id: int) -> int:
+        """
+        Очищает все сообщения пользователя.
+
+        Args:
+            user_id (int): Telegram User ID.
+
+        Returns:
+            int: Количество удаленных сообщений.
+        """
+        if not self.db:
+             raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            messages_ref = self.db.collection('users').document(str(user_id)).collection('messages')
+            docs = messages_ref.stream()
+            
+            count = 0
+            async for doc in docs:
+                await doc.reference.delete()
+                count += 1
+            
+            logger.info(f"Удалено {count} сообщений для пользователя {user_id}.")
+            return count
+        except Exception as e:
+            logger.error(f"Ошибка при очистке сообщений для {user_id}: {e}")
+            return 0

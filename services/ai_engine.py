@@ -60,7 +60,7 @@ class AIEngine:
             prompt = "Пожалуйста, дословно транскрибируй этот аудиофайл в текст. Если аудио пустое или неразборчивое, напиши '[Не удалось распознать речь]'."
 
             response = await self.client.aio.models.generate_content(
-                model="gemini-1.5-pro",
+                model="gemini-3-pro-preview",
                 contents=[
                     types.Content(
                         role="user",
@@ -101,7 +101,7 @@ class AIEngine:
             # Для простоты используем generate_content с промптом как user message.
 
             response = await self.client.aio.models.generate_content(
-                model="gemini-1.5-pro",
+                model="gemini-3-pro-preview",
                 contents=[
                     types.Content(
                         role="user",
@@ -163,7 +163,7 @@ class AIEngine:
             # Выполняем запрос к модели асинхронно
             # google-genai SDK поддерживает async через client.aio
             response = await self.client.aio.models.generate_content(
-                model="gemini-1.5-pro",
+                model="gemini-3-pro-preview",
                 contents=contents,
                 config=config
             )

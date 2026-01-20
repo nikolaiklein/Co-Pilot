@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-telegram-bot
 firebase-admin
+google-cloud-firestore
 google-genai
 pydantic
 python-dotenv

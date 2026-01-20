@@ -109,6 +109,7 @@ async def health_check():
     return {"status": "alive"}
 
 @app.post("/webhook")
+@app.post("/webhook/")
 async def telegram_webhook(request: Request):
     """
     Эндпоинт для получения обновлений от Telegram (Webhook).
