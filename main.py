@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from config.firebase_init import init_firebase
 from services.db import DatabaseService
 from services.telegram_bot import create_bot_app
+from services.ai_engine import AIEngine
 
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,15 +27,16 @@ app = FastAPI(
 # Глобальные переменные для сервисов
 db_service = None
 bot_app = None
+ai_engine = None
 
 # Событие запуска приложения
 @app.on_event("startup")
 async def startup_event():
     """
     Выполняется при старте приложения.
-    Здесь происходит инициализация внешних сервисов: Firebase, DB, Bot.
+    Здесь происходит инициализация внешних сервисов: Firebase, DB, AI, Bot.
     """
-    global db_service, bot_app
+    global db_service, bot_app, ai_engine
     logger.info("Запуск приложения...")
 
     # 1. Инициализация Firebase Admin
@@ -50,9 +52,19 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации DatabaseService: {e}")
 
-    # 3. Инициализация Telegram Bot Application
+    # 3. Инициализация AI Engine
     try:
-        bot_app = await create_bot_app()
+        ai_engine = AIEngine()
+        # Проверяем, удалось ли создать клиента (есть ли ключ)
+        if not ai_engine.client:
+            logger.warning("AI Engine инициализирован без клиента (нет API ключа).")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации AIEngine: {e}")
+
+    # 4. Инициализация Telegram Bot Application
+    try:
+        # Передаем db_service и ai_engine в функцию создания бота
+        bot_app = await create_bot_app(db_service, ai_engine)
         if bot_app:
              await bot_app.start()
              logger.info("Telegram Bot запущен.")
@@ -107,8 +119,6 @@ async def telegram_webhook(request: Request):
         update = Update.de_json(data, bot_app.bot)
 
         # Обрабатываем обновление асинхронно
-        # await bot_app.process_update(update) # В v20+ process_update уже async? Да.
-        # В документации PTB v20: await application.process_update(update)
         await bot_app.process_update(update)
 
         return {"status": "ok"}
