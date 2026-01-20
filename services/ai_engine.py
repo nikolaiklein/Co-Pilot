@@ -190,6 +190,56 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return "[Ошибка обработки аудио]"
 
+    async def analyze_image(self, image_bytes: bytes, user_message: str = "", user_profile: dict = None, user_name: str = None) -> str:
+        """
+        Анализирует изображение и отвечает на вопрос пользователя о нём.
+
+        Args:
+            image_bytes (bytes): Содержимое изображения.
+            user_message (str): Сообщение пользователя к изображению.
+            user_profile (dict): Профиль пользователя для контекста.
+            user_name (str): Имя пользователя.
+
+        Returns:
+            str: Ответ ИИ об изображении.
+        """
+        if not self.client:
+            return "Ошибка: API ключ не настроен."
+
+        try:
+            # Определяем MIME тип (jpeg по умолчанию, но поддерживаем png)
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+            # Строим промпт с учётом профиля пользователя
+            system_prompt = build_system_prompt(user_profile, user_name)
+            
+            if user_message:
+                prompt = f"Пользователь отправил изображение с сообщением: \"{user_message}\"\n\nОпиши что на изображении и ответь на сообщение пользователя."
+            else:
+                prompt = "Пользователь отправил изображение без текста. Опиши что на нём и спроси, чем можешь помочь в связи с этим изображением."
+
+            response = await self.client.aio.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=system_prompt + "\n\n" + prompt),
+                            image_part
+                        ]
+                    )
+                ]
+            )
+
+            if response.text:
+                return response.text.strip()
+            else:
+                return "Не удалось проанализировать изображение. Попробуйте отправить другое."
+
+        except Exception as e:
+            logger.error(f"Ошибка при анализе изображения: {e}")
+            return "Произошла ошибка при обработке изображения."
+
     async def analyze_content(self, prompt: str) -> str:
         """
         Анализирует контент на основе переданного промпта без истории чата.

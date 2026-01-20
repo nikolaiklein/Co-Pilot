@@ -3,8 +3,8 @@ import logging
 import io
 import re
 import html
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from services.db import DatabaseService
 
@@ -85,7 +85,7 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list:
 # Однако, для чистоты, будем использовать Any или просто duck typing.
 # from services.ai_engine import AIEngine
 
-async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
+async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None) -> Application:
     """
     Создает и настраивает приложение Telegram бота.
     Регистрирует обработчики сообщений.
@@ -93,6 +93,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
     Args:
         db_service (DatabaseService): Инициализированный сервис базы данных.
         ai_engine (AIEngine): Инициализированный сервис ИИ.
+        analyzer_service: Сервис анализа профиля (опционально).
 
     Returns:
         Application: Настроенное приложение python-telegram-bot.
@@ -153,6 +154,19 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
 
                 # 6. Сохраняем ответ ассистента
                 await db_service.save_message(user.id, "assistant", response_text)
+
+                # 6.1 Запускаем анализ профиля после каждых 3 сообщений пользователя
+                if analyzer_service:
+                    try:
+                        # Считаем сообщения пользователя в истории
+                        user_messages_count = len([m for m in history if m.get('role') == 'user'])
+                        if user_messages_count > 0 and user_messages_count % 3 == 0:
+                            logger.info(f"Запускаем анализ профиля для {user.id} (после {user_messages_count} сообщений)")
+                            # Запускаем в фоне, не ждём результата
+                            import asyncio
+                            asyncio.create_task(analyzer_service.analyze_user_profile(user.id))
+                    except Exception as analyzer_error:
+                        logger.warning(f"Не удалось запустить анализ профиля: {analyzer_error}")
 
                 # 7. Форматируем и отправляем ответ
                 formatted_response = markdown_to_telegram_html(response_text)
@@ -250,25 +264,41 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
             has_profile = existing_user and existing_user.get('profile_summary')
             
             if has_profile:
-                # Пользователь уже общался — приветствуем кратко
+                # Пользователь уже общался — приветствуем с кнопками
                 bot_name = existing_user.get('bot_nickname', 'Правильный Помощник')
-                welcome_message = f"С возвращением, {user.first_name}! 👋\n\nЯ {bot_name}, готов продолжить работу. Чем могу помочь?"
+                welcome_message = f"С возвращением, {user.first_name}! 👋\n\nЯ {bot_name}, готов продолжить работу."
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📋 Мой профиль", callback_data="cmd_myprofile"),
+                        InlineKeyboardButton("💬 Продолжить", callback_data="cmd_continue")
+                    ],
+                    [
+                        InlineKeyboardButton("❓ Помощь", callback_data="cmd_help"),
+                        InlineKeyboardButton("⚙️ Дать имя", callback_data="cmd_name_hint")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
             else:
-                # Новый пользователь — полное онбординг-сообщение
+                # Новый пользователь — онбординг с кнопками
                 welcome_message = f"""Привет, {user.first_name}! 👋
 
 Я подключен к нейросети нового поколения. Прямо сейчас я — чистый лист.
 
-Чтобы я стал твоим идеальным ассистентом, мне нужно узнать тебя. Мы можем начать с чего угодно:
-
-— Расскажи о проблеме, которая тебя сейчас волнует.
-— Или давай я проведу короткое интервью, чтобы составить твой профиль.
-
-Что выбираешь? (Можешь просто записать голосовое сообщение 🎙)
-
-💡 <i>Подсказка: используй /name чтобы дать мне имя</i>"""
+Чтобы стать твоим идеальным ассистентом, мне нужно узнать тебя. С чего начнём?"""
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("🎤 Интервью", callback_data="start_interview"),
+                        InlineKeyboardButton("💬 Свободный диалог", callback_data="start_freeform")
+                    ],
+                    [
+                        InlineKeyboardButton("❓ Что ты умеешь?", callback_data="cmd_help")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
             
-            await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
+            await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
         # Регистрируем обработчик команды /start
         application.add_handler(CommandHandler("start", handle_start))
@@ -493,11 +523,130 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
         # Регистрируем обработчик команды /correct
         application.add_handler(CommandHandler("correct", handle_correct))
 
+        async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает нажатия на inline-кнопки.
+            """
+            query = update.callback_query
+            await query.answer()  # Убираем "часики" на кнопке
+            
+            user = query.from_user
+            data = query.data
+            logger.info(f"Callback {data} от {user.id}")
+            
+            if data == "cmd_myprofile":
+                # Показать профиль
+                user_data = await db_service.get_user(user.id)
+                if not user_data or 'profile_summary' not in user_data:
+                    await query.message.reply_text(
+                        "📋 <b>Профиль пока пуст</b>\n\nПообщайся со мной, чтобы я узнал тебя лучше!",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    profile = user_data['profile_summary']
+                    text = "📋 <b>Твой профиль</b>\n\n"
+                    if isinstance(profile, dict):
+                        if profile.get('summary'):
+                            text += f"📝 {profile['summary']}\n\n"
+                        if profile.get('interests'):
+                            text += f"🎯 <b>Интересы:</b> {', '.join(profile['interests'][:5])}\n"
+                        if profile.get('dreams'):
+                            text += f"💭 <b>Цели:</b> {', '.join(profile['dreams'][:3])}\n"
+                    await query.message.reply_text(text, parse_mode=ParseMode.HTML)
+                    
+            elif data == "cmd_help":
+                help_text = """📚 <b>Что я умею:</b>
+
+🎯 <b>Учусь понимать тебя</b> — собираю профиль из диалогов
+📋 /myprofile — твоё досье
+✏️ /correct — исправить ошибку в профиле  
+🏷 /name — дать мне имя
+🗑 /clear — очистить историю
+
+💬 Просто пиши или 🎤 отправляй голосовые!"""
+                await query.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+                
+            elif data == "cmd_continue":
+                await query.message.reply_text("Слушаю тебя! О чём поговорим? 💬")
+                
+            elif data == "cmd_name_hint":
+                await query.message.reply_text(
+                    "🏷 <b>Дай мне имя!</b>\n\nНапиши: /name <i>Твоё_имя_для_меня</i>\n\nНапример: /name Макс",
+                    parse_mode=ParseMode.HTML
+                )
+                
+            elif data == "start_interview":
+                await query.message.reply_text(
+                    "🎤 <b>Давай познакомимся!</b>\n\n"
+                    "Расскажи немного о себе:\n"
+                    "— Чем занимаешься?\n"
+                    "— Какая главная цель на ближайший месяц?\n\n"
+                    "Можешь написать текстом или записать голосовое 🎙",
+                    parse_mode=ParseMode.HTML
+                )
+                
+            elif data == "start_freeform":
+                await query.message.reply_text(
+                    "💬 Отлично! Просто пиши мне о чём угодно.\n\n"
+                    "Я буду постепенно узнавать тебя из наших диалогов. Начинай! 🚀"
+                )
+
+        # Регистрируем обработчик callback query (inline кнопки)
+        application.add_handler(CallbackQueryHandler(handle_callback))
+
         # Регистрируем обработчик текстовых сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
         # Регистрируем обработчик голосовых сообщений
         application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+        async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает изображения от пользователя.
+            """
+            user = update.effective_user
+            logger.info(f"Получено фото от {user.id}")
+            
+            if not ai_engine:
+                await update.message.reply_text("❌ Сервис ИИ временно недоступен.")
+                return
+            
+            # Показываем индикатор "печатает"
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            
+            try:
+                # Получаем самое большое изображение
+                photo = update.message.photo[-1]  # Последний элемент = максимальный размер
+                file = await photo.get_file()
+                
+                # Скачиваем изображение
+                image_bytes = await file.download_as_bytearray()
+                
+                # Получаем caption (текст к фото) если есть
+                caption = update.message.caption or ""
+                
+                # Получаем профиль пользователя для контекста
+                user_data = await db_service.get_user(user.id)
+                user_profile = user_data if user_data else None
+                
+                # Анализируем изображение
+                response_text = await ai_engine.analyze_image(
+                    bytes(image_bytes),
+                    user_message=caption,
+                    user_profile=user_profile,
+                    user_name=user.first_name
+                )
+                
+                # Форматируем и отправляем ответ
+                formatted_response = markdown_to_telegram_html(response_text)
+                await send_long_message(update.message, formatted_response)
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки фото от {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось обработать изображение.")
+
+        # Регистрируем обработчик фото
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
         # Инициализируем приложение
         await application.initialize()

@@ -63,19 +63,7 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации AIEngine: {e}")
 
-    # 4. Инициализация Telegram Bot Application
-    try:
-        # Передаем db_service и ai_engine в функцию создания бота
-        bot_app = await create_bot_app(db_service, ai_engine)
-        if bot_app:
-             await bot_app.start()
-             logger.info("Telegram Bot запущен.")
-        else:
-             logger.warning("Bot Application не создано (возможно, нет токена).")
-    except Exception as e:
-        logger.error(f"Ошибка инициализации бота: {e}")
-
-    # 5. Инициализация Analyzer Service
+    # 4. Инициализация Analyzer Service (до бота, чтобы передать ему)
     try:
         if db_service and ai_engine:
             analyzer_service = AnalyzerService(db_service, ai_engine)
@@ -85,6 +73,17 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации Analyzer Service: {e}")
 
+    # 5. Инициализация Telegram Bot Application
+    try:
+        # Передаем db_service, ai_engine и analyzer_service в функцию создания бота
+        bot_app = await create_bot_app(db_service, ai_engine, analyzer_service)
+        if bot_app:
+             await bot_app.start()
+             logger.info("Telegram Bot запущен.")
+        else:
+             logger.warning("Bot Application не создано (возможно, нет токена).")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации бота: {e}")
 @app.on_event("shutdown")
 async def shutdown_event():
     """
