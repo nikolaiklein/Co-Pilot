@@ -283,6 +283,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
 /help — показать это сообщение
 /myprofile — посмотреть моё досье (навыки, интересы, мечты)
 /name — дать мне имя (например: /name Макс)
+/correct — исправить ошибку в профиле
 /clear — очистить историю диалога
 
 💬 Просто напишите мне сообщение, и я постараюсь помочь!
@@ -413,6 +414,84 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
 
         # Регистрируем обработчик команды /myprofile
         application.add_handler(CommandHandler("myprofile", handle_myprofile))
+
+        async def handle_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /correct — исправляет ошибки в профиле.
+            Пример: /correct убери что я не люблю Python
+            """
+            user = update.effective_user
+            logger.info(f"Команда /correct от {user.id}")
+            
+            args = context.args
+            
+            if not args:
+                await update.message.reply_text(
+                    "✏️ <b>Исправление профиля</b>\n\n"
+                    "Напиши что нужно исправить:\n"
+                    "<code>/correct убери что я не люблю Python</code>\n"
+                    "<code>/correct добавь что я увлекаюсь шахматами</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            correction_request = " ".join(args).strip()
+            
+            try:
+                # Получаем текущий профиль
+                user_data = await db_service.get_user(user.id)
+                current_profile = user_data.get('profile_summary', {}) if user_data else {}
+                
+                # Формируем промпт для ИИ на исправление
+                correction_prompt = f"""
+Текущий профиль пользователя:
+{current_profile}
+
+Запрос на исправление: "{correction_request}"
+
+Задача: Внеси исправление в профиль согласно запросу пользователя.
+Верни исправленный JSON профиля в формате:
+{{
+  "new_skills": [...],
+  "interests": [...],
+  "pain_points": [...],
+  "dreams": [...],
+  "summary": "..."
+}}
+
+Если нужно удалить элемент — убери его из списка.
+Если нужно добавить — добавь.
+Ответ должен содержать только JSON без markdown.
+"""
+                
+                # Отправляем запрос к ИИ
+                corrected_json = await ai_engine.analyze_content(correction_prompt)
+                
+                # Парсим и сохраняем
+                import json
+                corrected_json = corrected_json.replace("```json", "").replace("```", "").strip()
+                
+                try:
+                    corrected_profile = json.loads(corrected_json)
+                    await db_service.update_user(user.id, {"profile_summary": corrected_profile})
+                    
+                    await update.message.reply_text(
+                        "✅ <b>Профиль обновлён!</b>\n\n"
+                        f"Применено: {correction_request}\n\n"
+                        "Проверь изменения: /myprofile",
+                        parse_mode=ParseMode.HTML
+                    )
+                except json.JSONDecodeError:
+                    await update.message.reply_text(
+                        "⚠️ Не удалось обработать запрос. Попробуй сформулировать иначе."
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Ошибка исправления профиля для {user.id}: {e}")
+                await update.message.reply_text("❌ Произошла ошибка. Попробуй позже.")
+
+        # Регистрируем обработчик команды /correct
+        application.add_handler(CommandHandler("correct", handle_correct))
 
         # Регистрируем обработчик текстовых сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

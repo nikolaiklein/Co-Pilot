@@ -157,6 +157,113 @@ async def analyze_user_cron(user_id: int):
 
     return await analyzer_service.analyze_user_profile(user_id)
 
+@app.post("/cron/analyze-all")
+async def analyze_all_users_cron():
+    """
+    Эндпоинт для ежедневного анализа ВСЕХ пользователей.
+    Cloud Scheduler вызывает этот эндпоинт раз в сутки.
+
+    Returns:
+        dict: Статистика обработки.
+    """
+    if not analyzer_service or not db_service:
+        return {"status": "error", "message": "Services not initialized"}
+
+    try:
+        # Получаем список всех пользователей
+        user_ids = await db_service.get_all_user_ids()
+        
+        if not user_ids:
+            return {"status": "ok", "message": "No users to analyze", "processed": 0}
+        
+        # Анализируем каждого пользователя
+        results = {"success": 0, "failed": 0, "skipped": 0}
+        
+        for user_id in user_ids:
+            try:
+                result = await analyzer_service.analyze_user_profile(user_id)
+                if result.get("status") == "success":
+                    results["success"] += 1
+                elif result.get("status") == "skipped":
+                    results["skipped"] += 1
+                else:
+                    results["failed"] += 1
+            except Exception as e:
+                logger.error(f"Ошибка анализа пользователя {user_id}: {e}")
+                results["failed"] += 1
+        
+        logger.info(f"Batch analysis complete: {results}")
+        return {"status": "ok", "processed": len(user_ids), "results": results}
+        
+    except Exception as e:
+        logger.error(f"Ошибка batch-анализа: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/cron/weekly-digest")
+async def send_weekly_digest():
+    """
+    Эндпоинт для отправки еженедельных итогов всем пользователям.
+    Cloud Scheduler вызывает этот эндпоинт раз в неделю (пятница).
+
+    Returns:
+        dict: Статистика отправки.
+    """
+    if not db_service or not ai_engine or not bot_app:
+        return {"status": "error", "message": "Services not initialized"}
+
+    try:
+        user_ids = await db_service.get_all_user_ids()
+        
+        if not user_ids:
+            return {"status": "ok", "message": "No users", "sent": 0}
+        
+        sent_count = 0
+        
+        for user_id in user_ids:
+            try:
+                # Получаем профиль пользователя
+                user_data = await db_service.get_user(user_id)
+                
+                if not user_data or not user_data.get('profile_summary'):
+                    continue  # Пропускаем пользователей без профиля
+                
+                profile = user_data.get('profile_summary', {})
+                first_name = user_data.get('first_name', 'друг')
+                
+                # Формируем краткий дайджест
+                digest_text = f"📊 <b>Твои итоги недели, {first_name}!</b>\n\n"
+                
+                if profile.get('summary'):
+                    digest_text += f"📝 {profile['summary'][:200]}...\n\n" if len(profile.get('summary', '')) > 200 else f"📝 {profile['summary']}\n\n"
+                
+                if profile.get('dreams'):
+                    dreams = profile['dreams'][:3]  # Первые 3 мечты
+                    digest_text += "💭 <b>Твои цели:</b>\n"
+                    for dream in dreams:
+                        digest_text += f"  • {dream}\n"
+                    digest_text += "\nКак продвигаешься? Напиши мне!"
+                else:
+                    digest_text += "Расскажи о своих целях, и я помогу их достичь! 🚀"
+                
+                # Отправляем сообщение через Telegram
+                await bot_app.bot.send_message(
+                    chat_id=user_id,
+                    text=digest_text,
+                    parse_mode="HTML"
+                )
+                sent_count += 1
+                
+            except Exception as e:
+                logger.warning(f"Не удалось отправить дайджест пользователю {user_id}: {e}")
+                continue
+        
+        logger.info(f"Weekly digest sent to {sent_count} users")
+        return {"status": "ok", "sent": sent_count, "total": len(user_ids)}
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки weekly digest: {e}")
+        return {"status": "error", "message": str(e)}
+
 if __name__ == "__main__":
     # Этот блок используется только для локальной отладки при прямом запуске файла python main.py
     # В продакшене приложение запускается через uvicorn (см. Dockerfile)

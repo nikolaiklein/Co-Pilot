@@ -225,3 +225,29 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Ошибка при очистке сообщений для {user_id}: {e}")
             return 0
+
+    async def get_all_user_ids(self) -> list:
+        """
+        Получает список всех ID пользователей из БД.
+        Используется для batch-обработки (cron jobs).
+
+        Returns:
+            list: Список user_id всех пользователей.
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            users_ref = self.db.collection('users')
+            docs = users_ref.stream()
+            
+            user_ids = []
+            async for doc in docs:
+                # ID документа = user_id
+                user_ids.append(int(doc.id))
+            
+            logger.info(f"Найдено {len(user_ids)} пользователей для обработки.")
+            return user_ids
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка пользователей: {e}")
+            return []
