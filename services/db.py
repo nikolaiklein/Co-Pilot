@@ -68,6 +68,30 @@ class DatabaseService:
             logger.error(f"Неизвестная ошибка в get_or_create_user: {e}")
             raise e
 
+    async def get_user(self, user_id: int) -> dict | None:
+        """
+        Получает данные пользователя по ID.
+
+        Args:
+            user_id (int): Telegram User ID.
+
+        Returns:
+            dict | None: Данные пользователя или None, если не найден.
+        """
+        if not self.db:
+             raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            user_ref = self.db.collection('users').document(str(user_id))
+            user_doc = await user_ref.get()
+            
+            if user_doc.exists:
+                return user_doc.to_dict()
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка при получении пользователя {user_id}: {e}")
+            return None
+
     async def save_message(self, user_id: int, role: str, content: str):
         """
         Сохраняет сообщение в подколлекцию 'messages' документа пользователя.

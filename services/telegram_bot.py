@@ -136,8 +136,20 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
                 else:
                      history_for_ai = history
 
-                # 5. Генерируем ответ
-                response_text = await ai_engine.generate_response(user.id, user_text, history_for_ai)
+                # 5. Генерируем ответ, передавая профиль пользователя для динамического промпта
+                # user_data уже содержит profile_summary, если оно есть
+                # Но лучше явно получить свежий профиль, так как user_data выше был для get_or_create (инициализации)
+                # Хотя get_or_create возвращает актуальные данные, но если анализ прошел в фоне, profile_summary может обновиться
+                # Для надежности возьмем текущий профиль из user_data, а если там пусто - то из БД заново (но это лишний запрос).
+                # Пока используем то, что вернул get_or_create_user - это эффективно.
+                
+                response_text = await ai_engine.generate_response(
+                    user_id=user.id, 
+                    user_text=user_text, 
+                    history=history_for_ai,
+                    user_profile=user_data, # Передаем весь объект пользователя, внутри есть profile_summary
+                    user_name=user.first_name
+                )
 
                 # 6. Сохраняем ответ ассистента
                 await db_service.save_message(user.id, "assistant", response_text)
@@ -232,10 +244,31 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
                 "language_code": user.language_code,
                 "is_bot": user.is_bot
             }
-            await db_service.get_or_create_user(user.id, user_data)
+            existing_user = await db_service.get_or_create_user(user.id, user_data)
             
-            welcome_message = f"Привет, {user.first_name}! 👋\n\nЯ ваш AI-ассистент. Напишите мне что-нибудь, и я постараюсь помочь!"
-            await update.message.reply_text(welcome_message)
+            # Проверяем, есть ли уже профиль (повторный /start)
+            has_profile = existing_user and existing_user.get('profile_summary')
+            
+            if has_profile:
+                # Пользователь уже общался — приветствуем кратко
+                bot_name = existing_user.get('bot_nickname', 'Правильный Помощник')
+                welcome_message = f"С возвращением, {user.first_name}! 👋\n\nЯ {bot_name}, готов продолжить работу. Чем могу помочь?"
+            else:
+                # Новый пользователь — полное онбординг-сообщение
+                welcome_message = f"""Привет, {user.first_name}! 👋
+
+Я подключен к нейросети нового поколения. Прямо сейчас я — чистый лист.
+
+Чтобы я стал твоим идеальным ассистентом, мне нужно узнать тебя. Мы можем начать с чего угодно:
+
+— Расскажи о проблеме, которая тебя сейчас волнует.
+— Или давай я проведу короткое интервью, чтобы составить твой профиль.
+
+Что выбираешь? (Можешь просто записать голосовое сообщение 🎙)
+
+💡 <i>Подсказка: используй /name чтобы дать мне имя</i>"""
+            
+            await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML)
 
         # Регистрируем обработчик команды /start
         application.add_handler(CommandHandler("start", handle_start))
@@ -244,15 +277,59 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
             """
             Обрабатывает команду /help.
             """
-            help_text = """📚 **Список команд:**
+            help_text = """📚 <b>Список команд:</b>
 
 /start — начать работу с ботом
 /help — показать это сообщение
+/myprofile — посмотреть моё досье (навыки, интересы, мечты)
+/name — дать мне имя (например: /name Макс)
 /clear — очистить историю диалога
 
 💬 Просто напишите мне сообщение, и я постараюсь помочь!
 🎤 Также вы можете отправить голосовое сообщение."""
-            await update.message.reply_text(help_text)
+            await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+        # Регистрируем обработчик команды /help
+        application.add_handler(CommandHandler("help", handle_help))
+
+        async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /name — позволяет дать боту имя.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /name от {user.id}")
+            
+            # Получаем имя из аргументов команды
+            args = context.args
+            
+            if not args:
+                await update.message.reply_text(
+                    "💡 Чтобы дать мне имя, напиши:\n<code>/name Твоё_имя_для_меня</code>\n\nНапример: /name Макс",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            new_name = " ".join(args).strip()
+            
+            if len(new_name) > 50:
+                await update.message.reply_text("❌ Слишком длинное имя. Максимум 50 символов.")
+                return
+            
+            try:
+                # Сохраняем имя бота в профиль пользователя
+                await db_service.update_user(user.id, {"bot_nickname": new_name})
+                
+                await update.message.reply_text(
+                    f"✅ Отлично! Теперь я буду откликаться на имя <b>{new_name}</b>.\n\n"
+                    f"Приятно познакомиться, {user.first_name}! 🤝",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Ошибка сохранения имени бота для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось сохранить имя. Попробуй ещё раз.")
+
+        # Регистрируем обработчик команды /name
+        application.add_handler(CommandHandler("name", handle_name))
 
         # Регистрируем обработчик команды /help
         application.add_handler(CommandHandler("help", handle_help))
@@ -273,6 +350,69 @@ async def create_bot_app(db_service: DatabaseService, ai_engine) -> Application:
 
         # Регистрируем обработчик команды /clear
         application.add_handler(CommandHandler("clear", handle_clear))
+
+        async def handle_myprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /myprofile — показывает накопленное досье.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /myprofile от {user.id}")
+            
+            try:
+                user_data = await db_service.get_user(user.id)
+                
+                if not user_data or 'profile_summary' not in user_data:
+                    await update.message.reply_text(
+                        "📋 <b>Профиль пока пуст</b>\n\n"
+                        "Пообщайся со мной, и я постепенно соберу информацию о твоих навыках, "
+                        "интересах и целях!",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
+                profile = user_data['profile_summary']
+                
+                # Форматируем профиль
+                text = "📋 <b>Твой профиль Co-Pilot</b>\n\n"
+                
+                if isinstance(profile, dict):
+                    if profile.get('summary'):
+                        text += f"📝 <b>Портрет:</b>\n{profile['summary']}\n\n"
+
+                    if profile.get('new_skills'):
+                        text += "🛠 <b>Навыки:</b>\n"
+                        for skill in profile['new_skills']:
+                            text += f"  • {skill}\n"
+                        text += "\n"
+                    
+                    if profile.get('interests'):
+                        text += "🎯 <b>Интересы:</b>\n"
+                        for interest in profile['interests']:
+                            text += f"  • {interest}\n"
+                        text += "\n"
+                    
+                    if profile.get('pain_points'):
+                        text += "⚠️ <b>Точки роста:</b>\n"
+                        for pain in profile['pain_points']:
+                            text += f"  • {pain}\n"
+                        text += "\n"
+                    
+                    if profile.get('dreams'):
+                        text += "💭 <b>Мечты и идеи:</b>\n"
+                        for dream in profile['dreams']:
+                            text += f"  • {dream}\n"
+                        text += "\n"
+                else:
+                    text += str(profile)
+                
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                
+            except Exception as e:
+                logger.error(f"Ошибка получения профиля для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось загрузить профиль.")
+
+        # Регистрируем обработчик команды /myprofile
+        application.add_handler(CommandHandler("myprofile", handle_myprofile))
 
         # Регистрируем обработчик текстовых сообщений
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

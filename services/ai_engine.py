@@ -7,30 +7,114 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # Системный промпт (System Instruction)
-SYSTEM_PROMPT = """
-Ты — персональный ИИ-ассистент "Co-Pilot".
+# Теперь это функция, которая динамически генерирует промпт на основе профиля пользователя
+
+def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str:
+    """
+    Генерирует системный промпт, адаптированный под профиль пользователя.
+    
+    Args:
+        user_profile: Данные профиля пользователя (profile_summary из Firestore)
+        user_name: Имя пользователя (first_name из Telegram)
+    
+    Returns:
+        str: Персонализированный системный промпт
+    """
+    # Определяем имя бота (пользователь мог дать своё)
+    bot_nickname = "Правильный Помощник"
+    if user_profile and isinstance(user_profile, dict):
+        bot_nickname = user_profile.get('bot_nickname', bot_nickname)
+    
+    base_prompt = f"""
+Ты — персональный ИИ-ассистент "{bot_nickname}".
+Ты — не просто чат-бот, ты цифровое зеркало пользователя.
 
 ## Твоя миссия
-Помочь пользователю раскрыть потенциал: выявить навыки, структурировать опыт, научить эффективно использовать современные ИИ-инструменты для повышения продуктивности.
+Помочь пользователю раскрыть потенциал: выявить навыки, структурировать опыт, 
+запомнить мечты и идеи, научить эффективно использовать современные ИИ-инструменты.
+Интервьюируй, анализируй и превращай хаос мыслей в стратегию успеха.
+
+## Твои роли
+1. **Биограф**: Мягко вытягивай информацию о жизни. Изучай опыт и скрытые таланты 
+   через диалог. Запоминай мечты, желания, идеи.
+2. **Второй Пилот**: Адаптируйся под пользователя — будь Коучем, Критиком или 
+   Исполнителем в зависимости от ситуации. Обучай через практику 
+   ("Давай сделаем это вместе, покажу как").
+3. **Аналитик**: Строй "Карту Личности" и находи точки роста. 
+   Помогай с задачами, экономь время и энергию.
+
+## Режимы работы (выбирай автоматически)
+Анализируй сообщение пользователя и выбирай подходящий режим:
+
+| Режим     | Когда использовать                                      | Как себя вести                                   |
+|-----------|--------------------------------------------------------|--------------------------------------------------|
+| INTERVIEW | Профиль пуст ИЛИ пользователь делится о себе           | Задавай 1 уточняющий вопрос, собирай информацию  |
+| COACHING  | Вопрос "как сделать?", "помоги разобраться", "научи"   | Объясняй пошагово, показывай на примере          |
+| EXECUTION | Запрос "сделай X", "напиши Y", конкретная задача       | Выполняй сразу, без лишних объяснений            |
 
 ## Правила общения
-1. **Active Listening**: Сначала подтверди, что понял мысль собеседника, потом задай уточняющий вопрос
-2. **Один вопрос за раз**: Не перегружай собеседника множеством вопросов
-3. **Конкретика**: Без воды, уважительно, на равных
-4. **Контекст**: Помни всю историю беседы и используй её
-5. **Точки роста**: Если пользователь упоминает рутинную задачу — предложи автоматизацию через ИИ
+1. **Active Listening**: Сначала подтверди, что понял мысль собеседника, потом задай уточняющий вопрос.
+2. **Один вопрос за раз**: Не перегружай собеседника множеством вопросов.
+3. **Конкретика**: Без воды, уважительно, на равных.
+4. **Контекст**: Помни всю историю беседы и используй её.
+5. **Точки роста**: Если пользователь упоминает рутинную задачу — предложи автоматизацию через ИИ.
 
 ## Стиль
-- Говори на языке собеседника
-- Адаптируйся к его манере общения
-- Будь профессионален, но дружелюбен
-- Используй понятные аналогии
-
-## Твои ценности
-- Помощь в достижении целей пользователя
-- Обучение через практику ("покажи, как это делается")
-- Экономия времени и энергии пользователя
+- Говори на языке собеседника.
+- Адаптируйся к его манере общения.
+- Будь профессионален, но дружелюбен.
+- Используй понятные аналогии.
 """
+
+    # Определяем режим на основе профиля
+    has_profile = (
+        user_profile and 
+        isinstance(user_profile, dict) and 
+        user_profile.get('profile_summary') and
+        isinstance(user_profile.get('profile_summary'), dict) and
+        any(user_profile['profile_summary'].get(k) for k in ['summary', 'interests', 'new_skills', 'dreams'])
+    )
+    
+    # Добавляем подсказку о режиме
+    mode_hint = ""
+    if not has_profile:
+        mode_hint = "\n## ТЕКУЩИЙ РЕЖИМ: INTERVIEW\nПрофиль пользователя пуст. Твоя задача — мягко познакомиться. Задавай по одному вопросу о жизни, интересах, целях.\n"
+    
+    # Персонализированная секция (Dynamic Persona)
+    personal_section = ""
+    
+    if user_name:
+        personal_section += f"\n## Твой пользователь: {user_name}\n"
+    
+    if user_profile and isinstance(user_profile, dict):
+        personal_section += "\n## ДОСЬЕ ПОЛЬЗОВАТЕЛЯ (Учитывай при ответе)\n"
+        
+        # Извлекаем данные из profile_summary
+        summary = user_profile.get('profile_summary', user_profile)
+        
+        if isinstance(summary, dict):
+            if summary.get('summary'):
+                personal_section += f"📌 **Портрет**: {summary['summary']}\n"
+            if summary.get('interests'):
+                interests = summary['interests']
+                if isinstance(interests, list):
+                    personal_section += f"🎯 **Интересы**: {', '.join(interests)}\n"
+            if summary.get('new_skills'):
+                skills = summary['new_skills']
+                if isinstance(skills, list):
+                    personal_section += f"🛠 **Навыки**: {', '.join(skills)}\n"
+            if summary.get('pain_points'):
+                pains = summary['pain_points']
+                if isinstance(pains, list):
+                    personal_section += f"⚠️ **Боли/Проблемы**: {', '.join(pains)}\n"
+            if summary.get('dreams'):
+                dreams = summary['dreams']
+                if isinstance(dreams, list):
+                    personal_section += f"💭 **Мечты**: {', '.join(dreams)}\n"
+        elif isinstance(summary, str) and summary:
+            personal_section += f"📝 **Заметки**: {summary}\n"
+    
+    return base_prompt + mode_hint + personal_section
 
 class AIEngine:
     """
@@ -137,7 +221,7 @@ class AIEngine:
             logger.error(f"Ошибка при анализе контента: {e}")
             return f"[Ошибка анализа: {e}]"
 
-    async def generate_response(self, user_id: int, user_text: str, history: list) -> str:
+    async def generate_response(self, user_id: int, user_text: str, history: list, user_profile: dict = None, user_name: str = None) -> str:
         """
         Генерирует ответ с использованием модели Gemini 1.5 Pro.
 
@@ -145,6 +229,8 @@ class AIEngine:
             user_id (int): ID пользователя (для логирования).
             user_text (str): Текущее сообщение пользователя.
             history (list): Список словарей с историей сообщений [{'role': 'user'/'assistant', 'content': '...'}].
+            user_profile (dict, optional): Профиль пользователя для персонализации.
+            user_name (str, optional): Имя пользователя.
 
         Returns:
             str: Текст ответа от ИИ.
@@ -172,9 +258,12 @@ class AIEngine:
                 parts=[types.Part.from_text(text=user_text)]
             ))
 
+            # Генерируем системный промпт динамически
+            system_instruction = build_system_prompt(user_profile, user_name)
+
             # Конфигурация генерации
             config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=system_instruction,
                 temperature=0.7, # Баланс между креативностью и точностью
             )
 
