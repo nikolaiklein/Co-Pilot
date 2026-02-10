@@ -1,8 +1,7 @@
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-python-telegram-bot==21.7
-firebase-admin==6.6.0
-google-cloud-firestore==2.19.0
-google-genai==1.0.0
-pydantic==2.10.0
-python-dotenv==1.0.1
+fastapi
+uvicorn
+python-telegram-bot
+firebase-admin
+google-genai
+pydantic
+python-dotenv

@@ -6,7 +6,3 @@ __pycache__/
 env/
 venv/
 *.log
-
-# Firebase Service Account Key (sensitive!)
-serviceAccountKey.json
-**/serviceAccountKey.json
