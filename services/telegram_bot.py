@@ -103,10 +103,24 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         logger.warning("TELEGRAM_BOT_TOKEN не найден в переменных окружения.")
         return None
 
+    # Список разрешённых пользователей (пустой = все разрешены)
+    allowed_users_str = os.getenv("ALLOWED_USERS", "")
+    allowed_users = set()
+    if allowed_users_str.strip():
+        allowed_users = {int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()}
+    if allowed_users:
+        logger.info(f"Авторизация включена. Разрешённые пользователи: {allowed_users}")
+
     try:
         # Создаем билдер приложения
         builder = Application.builder().token(token)
         application = builder.build()
+
+        def is_authorized(user_id: int) -> bool:
+            """Проверяет, авторизован ли пользователь."""
+            if not allowed_users:
+                return True
+            return user_id in allowed_users
 
         # Общая функция для обработки логики диалога (используется для текста и голоса)
         async def process_dialog_turn(user, chat_id, user_text, context):
@@ -193,8 +207,10 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             Обрабатывает входящие текстовые сообщения.
             """
             user = update.effective_user
-            message_text = update.message.text
+            if not is_authorized(user.id):
+                return
 
+            message_text = update.message.text
             if not message_text:
                 return
 
@@ -644,6 +660,15 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             except Exception as e:
                 logger.error(f"Ошибка обработки фото от {user.id}: {e}")
                 await update.message.reply_text("❌ Не удалось обработать изображение.")
+
+        async def send_long_message(message, text: str):
+            """Отправляет длинное сообщение, разбивая на части."""
+            parts = split_message(text)
+            for part in parts:
+                try:
+                    await message.reply_text(part, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await message.reply_text(part)
 
         # Регистрируем обработчик фото
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))

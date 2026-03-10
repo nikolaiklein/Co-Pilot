@@ -1,51 +1,39 @@
 import os
 import logging
-from google import genai
-from google.genai import types
+from abc import ABC, abstractmethod
 
-# Настройка логирования
 logger = logging.getLogger(__name__)
 
-# Системный промпт (System Instruction)
-# Теперь это функция, которая динамически генерирует промпт на основе профиля пользователя
+
+# --- Системный промпт ---
 
 def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str:
     """
     Генерирует системный промпт, адаптированный под профиль пользователя.
-    
-    Args:
-        user_profile: Данные профиля пользователя (profile_summary из Firestore)
-        user_name: Имя пользователя (first_name из Telegram)
-    
-    Returns:
-        str: Персонализированный системный промпт
     """
-    # Определяем имя бота (пользователь мог дать своё)
     bot_nickname = "Правильный Помощник"
     if user_profile and isinstance(user_profile, dict):
         bot_nickname = user_profile.get('bot_nickname', bot_nickname)
-    
+
     base_prompt = f"""
 Ты — персональный ИИ-ассистент "{bot_nickname}".
 Ты — не просто чат-бот, ты цифровое зеркало пользователя.
 
 ## Твоя миссия
-Помочь пользователю раскрыть потенциал: выявить навыки, структурировать опыт, 
+Помочь пользователю раскрыть потенциал: выявить навыки, структурировать опыт,
 запомнить мечты и идеи, научить эффективно использовать современные ИИ-инструменты.
 Интервьюируй, анализируй и превращай хаос мыслей в стратегию успеха.
 
 ## Твои роли
-1. **Биограф**: Мягко вытягивай информацию о жизни. Изучай опыт и скрытые таланты 
+1. **Биограф**: Мягко вытягивай информацию о жизни. Изучай опыт и скрытые таланты
    через диалог. Запоминай мечты, желания, идеи.
-2. **Второй Пилот**: Адаптируйся под пользователя — будь Коучем, Критиком или 
-   Исполнителем в зависимости от ситуации. Обучай через практику 
+2. **Второй Пилот**: Адаптируйся под пользователя — будь Коучем, Критиком или
+   Исполнителем в зависимости от ситуации. Обучай через практику
    ("Давай сделаем это вместе, покажу как").
-3. **Аналитик**: Строй "Карту Личности" и находи точки роста. 
+3. **Аналитик**: Строй "Карту Личности" и находи точки роста.
    Помогай с задачами, экономь время и энергию.
 
 ## Режимы работы (выбирай автоматически)
-Анализируй сообщение пользователя и выбирай подходящий режим:
-
 | Режим     | Когда использовать                                      | Как себя вести                                   |
 |-----------|--------------------------------------------------------|--------------------------------------------------|
 | INTERVIEW | Профиль пуст ИЛИ пользователь делится о себе           | Задавай 1 уточняющий вопрос, собирай информацию  |
@@ -73,271 +61,398 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str
 - /help — список всех команд
 """
 
-    # Определяем режим на основе профиля
     has_profile = (
-        user_profile and 
-        isinstance(user_profile, dict) and 
+        user_profile and
+        isinstance(user_profile, dict) and
         user_profile.get('profile_summary') and
         isinstance(user_profile.get('profile_summary'), dict) and
         any(user_profile['profile_summary'].get(k) for k in ['summary', 'interests', 'new_skills', 'dreams'])
     )
-    
-    # Добавляем подсказку о режиме
+
     mode_hint = ""
     if not has_profile:
         mode_hint = "\n## ТЕКУЩИЙ РЕЖИМ: INTERVIEW\nПрофиль пользователя пуст. Твоя задача — мягко познакомиться. Задавай по одному вопросу о жизни, интересах, целях.\n"
-    
-    # Персонализированная секция (Dynamic Persona)
+
     personal_section = ""
-    
     if user_name:
         personal_section += f"\n## Твой пользователь: {user_name}\n"
-    
+
     if user_profile and isinstance(user_profile, dict):
         personal_section += "\n## ДОСЬЕ ПОЛЬЗОВАТЕЛЯ (Учитывай при ответе)\n"
-        
-        # Извлекаем данные из profile_summary
         summary = user_profile.get('profile_summary', user_profile)
-        
         if isinstance(summary, dict):
             if summary.get('summary'):
                 personal_section += f"📌 **Портрет**: {summary['summary']}\n"
-            if summary.get('interests'):
-                interests = summary['interests']
-                if isinstance(interests, list):
-                    personal_section += f"🎯 **Интересы**: {', '.join(interests)}\n"
-            if summary.get('new_skills'):
-                skills = summary['new_skills']
-                if isinstance(skills, list):
-                    personal_section += f"🛠 **Навыки**: {', '.join(skills)}\n"
-            if summary.get('pain_points'):
-                pains = summary['pain_points']
-                if isinstance(pains, list):
-                    personal_section += f"⚠️ **Боли/Проблемы**: {', '.join(pains)}\n"
-            if summary.get('dreams'):
-                dreams = summary['dreams']
-                if isinstance(dreams, list):
-                    personal_section += f"💭 **Мечты**: {', '.join(dreams)}\n"
+            if summary.get('interests') and isinstance(summary['interests'], list):
+                personal_section += f"🎯 **Интересы**: {', '.join(summary['interests'])}\n"
+            if summary.get('new_skills') and isinstance(summary['new_skills'], list):
+                personal_section += f"🛠 **Навыки**: {', '.join(summary['new_skills'])}\n"
+            if summary.get('pain_points') and isinstance(summary['pain_points'], list):
+                personal_section += f"⚠️ **Боли/Проблемы**: {', '.join(summary['pain_points'])}\n"
+            if summary.get('dreams') and isinstance(summary['dreams'], list):
+                personal_section += f"💭 **Мечты**: {', '.join(summary['dreams'])}\n"
         elif isinstance(summary, str) and summary:
             personal_section += f"📝 **Заметки**: {summary}\n"
-    
+
     return base_prompt + mode_hint + personal_section
+
+
+# --- Абстрактный провайдер ---
+
+class BaseProvider(ABC):
+    """Базовый класс для AI провайдеров."""
+
+    @abstractmethod
+    async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
+        """Генерирует ответ на основе истории сообщений."""
+        ...
+
+    @abstractmethod
+    async def analyze(self, prompt: str) -> str:
+        """Анализирует контент по заданному промпту (без истории)."""
+        ...
+
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        """Транскрибирует аудио. По умолчанию не поддерживается."""
+        return "[Транскрибация аудио не поддерживается этим провайдером]"
+
+    async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
+        """Анализирует изображение. По умолчанию не поддерживается."""
+        return "[Анализ изображений не поддерживается этим провайдером]"
+
+
+# --- Gemini ---
+
+class GeminiProvider(BaseProvider):
+    """Провайдер для Google Gemini API."""
+
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+        from google import genai
+        self.genai = genai
+        self.types = genai.types
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+        logger.info(f"GeminiProvider инициализирован (модель: {model})")
+
+    async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
+        contents = []
+        for msg in messages:
+            role = "user" if msg['role'] == "user" else "model"
+            contents.append(self.types.Content(
+                role=role,
+                parts=[self.types.Part.from_text(text=msg['content'])]
+            ))
+
+        config = self.types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=temperature,
+        )
+
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config
+        )
+        return response.text if response.text else ""
+
+    async def analyze(self, prompt: str) -> str:
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=[self.types.Content(
+                role="user",
+                parts=[self.types.Part.from_text(text=prompt)]
+            )]
+        )
+        return response.text.strip() if response.text else ""
+
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        audio_part = self.types.Part.from_bytes(data=file_bytes, mime_type="audio/ogg")
+        prompt = "Пожалуйста, дословно транскрибируй этот аудиофайл в текст. Если аудио пустое или неразборчивое, напиши '[Не удалось распознать речь]'."
+
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=[self.types.Content(
+                role="user",
+                parts=[self.types.Part.from_text(text=prompt), audio_part]
+            )]
+        )
+        return response.text.strip() if response.text else "[Не удалось распознать речь]"
+
+    async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
+        image_part = self.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+        full_prompt = (system_prompt + "\n\n" + prompt) if system_prompt else prompt
+
+        response = await self.client.aio.models.generate_content(
+            model=self.model,
+            contents=[self.types.Content(
+                role="user",
+                parts=[self.types.Part.from_text(text=full_prompt), image_part]
+            )]
+        )
+        return response.text.strip() if response.text else ""
+
+
+# --- Anthropic Claude ---
+
+class ClaudeProvider(BaseProvider):
+    """Провайдер для Anthropic Claude API."""
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+        import anthropic
+        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.model = model
+        logger.info(f"ClaudeProvider инициализирован (модель: {model})")
+
+    async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
+        api_messages = []
+        for msg in messages:
+            role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
+            api_messages.append({"role": role, "content": msg['content']})
+
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=api_messages,
+            temperature=temperature,
+        )
+        return response.content[0].text if response.content else ""
+
+    async def analyze(self, prompt: str) -> str:
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip() if response.content else ""
+
+    async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
+        import base64
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        response = await self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            system=system_prompt or "",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return response.content[0].text.strip() if response.content else ""
+
+
+# --- OpenAI ---
+
+class OpenAIProvider(BaseProvider):
+    """Провайдер для OpenAI API."""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        import openai
+        self.client = openai.AsyncOpenAI(api_key=api_key)
+        self.model = model
+        logger.info(f"OpenAIProvider инициализирован (модель: {model})")
+
+    async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
+        api_messages = [{"role": "system", "content": system_prompt}]
+        for msg in messages:
+            role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
+            api_messages.append({"role": role, "content": msg['content']})
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=api_messages,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
+
+    async def analyze(self, prompt: str) -> str:
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        import io
+        audio_file = io.BytesIO(file_bytes)
+        audio_file.name = "voice.ogg"
+        response = await self.client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru",
+        )
+        return response.text.strip() if response.text else "[Не удалось распознать речь]"
+
+    async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
+        import base64
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        })
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+
+# --- Фабрика провайдеров ---
+
+PROVIDER_MAP = {
+    "gemini": GeminiProvider,
+    "anthropic": ClaudeProvider,
+    "openai": OpenAIProvider,
+}
+
+DEFAULT_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "anthropic": "claude-sonnet-4-20250514",
+    "openai": "gpt-4o",
+}
+
+def parse_model_string(model_string: str) -> tuple[str, str]:
+    """
+    Парсит строку формата 'provider/model' в кортеж (provider, model).
+    Пример: 'gemini/gemini-2.5-flash' -> ('gemini', 'gemini-2.5-flash')
+    """
+    if '/' in model_string:
+        provider, model = model_string.split('/', 1)
+        return provider.lower(), model
+    return model_string.lower(), DEFAULT_MODELS.get(model_string.lower(), model_string)
+
+
+def create_provider(provider_name: str, model: str) -> BaseProvider:
+    """Создаёт экземпляр провайдера по имени."""
+    key_map = {
+        "gemini": "GEMINI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+    }
+    env_var = key_map.get(provider_name)
+    if not env_var:
+        raise ValueError(f"Неизвестный провайдер: {provider_name}")
+
+    api_key = os.getenv(env_var)
+    if not api_key:
+        raise ValueError(f"API ключ {env_var} не задан")
+
+    cls = PROVIDER_MAP[provider_name]
+    return cls(api_key=api_key, model=model)
+
+
+# --- Главный движок ---
 
 class AIEngine:
     """
-    Класс для работы с Gemini API через google-genai SDK.
-    Отвечает за генерацию ответов на основе истории переписки.
+    Мульти-провайдерный AI движок.
+    Поддерживает Gemini, Claude, OpenAI. Выбор модели через DEFAULT_MODEL
+    или переключение пользователем.
     """
 
     def __init__(self):
-        """
-        Инициализация клиента Gemini.
-        API ключ берется из переменной окружения GEMINI_API_KEY (или GOOGLE_API_KEY).
-        """
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            logger.warning("GEMINI_API_KEY или GOOGLE_API_KEY не найдены. AI Engine не будет работать.")
-            self.client = None
-        else:
-            try:
-                self.client = genai.Client(api_key=api_key)
-                logger.info("Gemini Client успешно инициализирован.")
-            except Exception as e:
-                logger.error(f"Ошибка при инициализации Gemini Client: {e}")
-                self.client = None
+        self.providers: dict[str, BaseProvider] = {}
+        self.default_provider_name: str = ""
+        self.default_model: str = ""
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
-        """
-        Транскрибирует аудиофайл в текст, используя Gemini.
-
-        Args:
-            file_bytes (bytes): Содержимое аудиофайла.
-
-        Returns:
-            str: Расшифрованный текст.
-        """
-        if not self.client:
-            return "Ошибка: API ключ не настроен."
+        # Парсим DEFAULT_MODEL из env
+        default = os.getenv("DEFAULT_MODEL", "gemini/gemini-2.5-flash")
+        provider_name, model = parse_model_string(default)
 
         try:
-            # Создаем объект Part из байтов аудио
-            # Для Telegram voice messages формат обычно OGG (Opus)
-            # Gemini поддерживает audio/ogg
-            audio_part = types.Part.from_bytes(data=file_bytes, mime_type="audio/ogg")
+            self.providers[provider_name] = create_provider(provider_name, model)
+            self.default_provider_name = provider_name
+            self.default_model = model
+            logger.info(f"AI Engine: провайдер по умолчанию — {provider_name}/{model}")
+        except ValueError as e:
+            logger.warning(f"Не удалось создать провайдер по умолчанию: {e}")
 
-            # Отправляем запрос только на транскрибацию
-            prompt = "Пожалуйста, дословно транскрибируй этот аудиофайл в текст. Если аудио пустое или неразборчивое, напиши '[Не удалось распознать речь]'."
+        # Для обратной совместимости: self.client != None означает, что движок готов
+        self.client = self.providers.get(self.default_provider_name)
 
-            response = await self.client.aio.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=prompt),
-                            audio_part
-                        ]
-                    )
-                ]
-            )
+    def get_provider(self, provider_name: str = None, model: str = None) -> BaseProvider:
+        """Возвращает провайдер. Если не указан — дефолтный."""
+        if not provider_name:
+            provider_name = self.default_provider_name
+        if not model:
+            model = DEFAULT_MODELS.get(provider_name, "")
 
-            if response.text:
-                return response.text.strip()
-            else:
-                return "[Не удалось распознать речь]"
+        if provider_name not in self.providers:
+            self.providers[provider_name] = create_provider(provider_name, model)
 
+        return self.providers[provider_name]
+
+    async def generate_response(
+        self,
+        user_id: int,
+        user_text: str,
+        history: list,
+        user_profile: dict = None,
+        user_name: str = None,
+        provider_name: str = None,
+    ) -> str:
+        """Генерирует ответ ИИ с учётом истории и профиля пользователя."""
+        try:
+            provider = self.get_provider(provider_name)
+        except ValueError as e:
+            logger.error(f"Провайдер недоступен: {e}")
+            return "Извините, сервис ИИ временно недоступен."
+
+        try:
+            system_prompt = build_system_prompt(user_profile, user_name)
+            messages = list(history) + [{"role": "user", "content": user_text}]
+            response = await provider.generate(messages, system_prompt)
+            if response:
+                return response
+            logger.warning(f"Пустой ответ для пользователя {user_id}")
+            return "Извините, я не смог сформировать ответ. Попробуйте еще раз."
+        except Exception as e:
+            logger.error(f"Ошибка при генерации ответа для {user_id}: {e}")
+            return "Произошла ошибка при обращении к ИИ. Пожалуйста, повторите попытку позже."
+
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        """Транскрибирует аудио через текущий провайдер."""
+        try:
+            provider = self.get_provider()
+            return await provider.transcribe_audio(file_bytes)
         except Exception as e:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return "[Ошибка обработки аудио]"
 
-    async def analyze_image(self, image_bytes: bytes, user_message: str = "", user_profile: dict = None, user_name: str = None) -> str:
-        """
-        Анализирует изображение и отвечает на вопрос пользователя о нём.
-
-        Args:
-            image_bytes (bytes): Содержимое изображения.
-            user_message (str): Сообщение пользователя к изображению.
-            user_profile (dict): Профиль пользователя для контекста.
-            user_name (str): Имя пользователя.
-
-        Returns:
-            str: Ответ ИИ об изображении.
-        """
-        if not self.client:
-            return "Ошибка: API ключ не настроен."
-
-        try:
-            # Определяем MIME тип (jpeg по умолчанию, но поддерживаем png)
-            image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-
-            # Строим промпт с учётом профиля пользователя
-            system_prompt = build_system_prompt(user_profile, user_name)
-            
-            if user_message:
-                prompt = f"Пользователь отправил изображение с сообщением: \"{user_message}\"\n\nОпиши что на изображении и ответь на сообщение пользователя."
-            else:
-                prompt = "Пользователь отправил изображение без текста. Опиши что на нём и спроси, чем можешь помочь в связи с этим изображением."
-
-            response = await self.client.aio.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=system_prompt + "\n\n" + prompt),
-                            image_part
-                        ]
-                    )
-                ]
-            )
-
-            if response.text:
-                return response.text.strip()
-            else:
-                return "Не удалось проанализировать изображение. Попробуйте отправить другое."
-
-        except Exception as e:
-            logger.error(f"Ошибка при анализе изображения: {e}")
-            return "Произошла ошибка при обработке изображения."
-
     async def analyze_content(self, prompt: str) -> str:
-        """
-        Анализирует контент на основе переданного промпта без истории чата.
-
-        Args:
-            prompt (str): Промпт для анализа.
-
-        Returns:
-            str: Результат анализа.
-        """
-        if not self.client:
-            return "Ошибка: API ключ не настроен."
-
+        """Анализирует контент через текущий провайдер."""
         try:
-            # Для анализа не нужна системная инструкция "биографа",
-            # так как мы явно задаем задачу в промпте.
-            # Но можно оставить дефолтную или переопределить.
-            # Для простоты используем generate_content с промптом как user message.
-
-            response = await self.client.aio.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=prompt)]
-                    )
-                ]
-            )
-
-            if response.text:
-                return response.text.strip()
-            else:
-                return "[Не удалось получить результат анализа]"
-
+            provider = self.get_provider()
+            return await provider.analyze(prompt)
         except Exception as e:
             logger.error(f"Ошибка при анализе контента: {e}")
             return f"[Ошибка анализа: {e}]"
 
-    async def generate_response(self, user_id: int, user_text: str, history: list, user_profile: dict = None, user_name: str = None) -> str:
-        """
-        Генерирует ответ с использованием модели Gemini 1.5 Pro.
-
-        Args:
-            user_id (int): ID пользователя (для логирования).
-            user_text (str): Текущее сообщение пользователя.
-            history (list): Список словарей с историей сообщений [{'role': 'user'/'assistant', 'content': '...'}].
-            user_profile (dict, optional): Профиль пользователя для персонализации.
-            user_name (str, optional): Имя пользователя.
-
-        Returns:
-            str: Текст ответа от ИИ.
-        """
-        if not self.client:
-            return "Извините, сервис ИИ временно недоступен (API ключ не настроен)."
-
+    async def analyze_image(
+        self,
+        image_bytes: bytes,
+        user_message: str = "",
+        user_profile: dict = None,
+        user_name: str = None,
+    ) -> str:
+        """Анализирует изображение через текущий провайдер."""
         try:
-            # Формируем историю сообщений в формате, который принимает API
-            # API ожидает список объектов Content или словарей.
-            # user -> user
-            # assistant -> model
-            contents = []
-
-            for msg in history:
-                role = "user" if msg['role'] == "user" else "model"
-                contents.append(types.Content(
-                    role=role,
-                    parts=[types.Part.from_text(text=msg['content'])]
-                ))
-
-            # Добавляем текущее сообщение пользователя в конец истории
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_text)]
-            ))
-
-            # Генерируем системный промпт динамически
-            system_instruction = build_system_prompt(user_profile, user_name)
-
-            # Конфигурация генерации
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.7, # Баланс между креативностью и точностью
-            )
-
-            # Выполняем запрос к модели асинхронно
-            # google-genai SDK поддерживает async через client.aio
-            response = await self.client.aio.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=contents,
-                config=config
-            )
-
-            if response.text:
-                return response.text
+            provider = self.get_provider()
+            system_prompt = build_system_prompt(user_profile, user_name)
+            if user_message:
+                prompt = f'Пользователь отправил изображение с сообщением: "{user_message}"\n\nОпиши что на изображении и ответь на сообщение пользователя.'
             else:
-                logger.warning(f"Пустой ответ от Gemini для пользователя {user_id}")
-                return "Извините, я не смог сформировать ответ. Попробуйте еще раз."
-
+                prompt = "Пользователь отправил изображение без текста. Опиши что на нём и спроси, чем можешь помочь."
+            return await provider.analyze_image(image_bytes, prompt, system_prompt)
         except Exception as e:
-            logger.error(f"Ошибка при генерации ответа для {user_id}: {e}")
-            return "Произошла ошибка при обращении к ИИ. Пожалуйста, повторите попытку позже."
+            logger.error(f"Ошибка при анализе изображения: {e}")
+            return "Произошла ошибка при обработке изображения."
