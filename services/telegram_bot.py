@@ -134,7 +134,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 if user.id in bulk_mode_users:
                     if memory_service:
                         import asyncio
-                        asyncio.create_task(memory_service.store_message(user.id, "user", user_text))
+                        await memory_service.store_message(user.id, "user", user_text)
                         bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
                         count = bulk_mode_users[user.id]
                         # Отвечаем кратко каждые 5 сообщений, иначе тихо
@@ -209,8 +209,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 # 6.1 Сохраняем в долговременную память (фоново)
                 if memory_service:
                     import asyncio
-                    asyncio.create_task(memory_service.store_message(user.id, "user", user_text))
-                    asyncio.create_task(memory_service.store_message(user.id, "assistant", response_text))
+                    await memory_service.store_message(user.id, "user", user_text)
+                    await memory_service.store_message(user.id, "assistant", response_text)
 
                 # 6.2 Запускаем анализ профиля после каждых 3 сообщений пользователя
                 if analyzer_service:
@@ -879,7 +879,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                         chunks = _split_text_to_chunks(text, max_len=1500)
                         for chunk in chunks:
                             content = f"[Файл: {file_name}] {chunk}"
-                            asyncio.create_task(memory_service.store_message(user.id, "user", content))
+                            await memory_service.store_message(user.id, "user", content)
 
                         bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + len(chunks)
                         await update.message.reply_text(

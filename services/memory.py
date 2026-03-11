@@ -18,6 +18,7 @@ Firestore structure:
 
 import os
 import re
+import asyncio
 import logging
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
@@ -42,6 +43,11 @@ class MemoryService:
         self.db = db
         self.api_key = gemini_api_key
         self._http_session = None
+        # Семафор: макс 5 параллельных вызовов к Embedding API
+        self._embedding_semaphore = asyncio.Semaphore(5)
+        # Очередь для фоновых задач (store_message)
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task = None
         logger.info("MemoryService инициализирован.")
 
     async def _get_session(self):
@@ -51,13 +57,53 @@ class MemoryService:
             self._http_session = aiohttp.ClientSession()
         return self._http_session
 
+    async def _start_worker(self):
+        """Запускает воркер очереди если ещё не запущен."""
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._queue_worker())
+
+    async def _queue_worker(self):
+        """Воркер: обрабатывает очередь store_message по одному, с семафором."""
+        while True:
+            try:
+                user_id, role, content = await asyncio.wait_for(self._queue.get(), timeout=300)
+                await self._do_store_message(user_id, role, content)
+                self._queue.task_done()
+            except asyncio.TimeoutError:
+                logger.info("Memory queue worker: idle 5 min, shutting down")
+                break
+            except Exception as e:
+                logger.error(f"Memory queue worker error: {e}")
+
+    async def enqueue_store(self, user_id: int, role: str, content: str):
+        """Ставит сообщение в очередь для фонового сохранения с эмбеддингом."""
+        await self._queue.put((user_id, role, content))
+        await self._start_worker()
+        logger.info(f"Memory queued for user {user_id} (role={role}, queue_size={self._queue.qsize()})")
+
     async def close(self):
-        """Закрыть HTTP-сессию."""
+        """Закрыть HTTP-сессию и остановить воркер."""
+        if self._worker_task and not self._worker_task.done():
+            # Дождёмся обработки оставшихся задач (макс 30 сек)
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("Memory queue not drained in 30s, stopping worker")
+            self._worker_task.cancel()
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
 
     async def get_embedding(self, text: str) -> list[float] | None:
         """Получить эмбеддинг текста через Gemini Embedding API (768 dimensions)."""
+        try:
+            async with self._embedding_semaphore:
+                return await self._get_embedding_impl(text)
+        except Exception as e:
+            logger.error(f"Ошибка получения эмбеддинга: {e}")
+            return None
+
+    async def _get_embedding_impl(self, text: str) -> list[float] | None:
+        """Внутренняя реализация получения эмбеддинга."""
         try:
             session = await self._get_session()
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
@@ -89,14 +135,20 @@ class MemoryService:
 
     async def store_message(self, user_id: int, role: str, content: str):
         """
+        Ставит сообщение в очередь для фонового сохранения.
+        Не блокирует вызывающий код — возвращается сразу.
+        """
+        await self.enqueue_store(user_id, role, content)
+
+    async def _do_store_message(self, user_id: int, role: str, content: str):
+        """
         Сохранить сообщение с эмбеддингом в коллекцию memory.
-        Вызывается асинхронно после каждого сообщения.
+        Вызывается воркером очереди.
         """
         try:
             embedding = await self.get_embedding(content)
             if not embedding:
                 logger.warning(f"Не удалось получить эмбеддинг, сохраняем без вектора")
-                # Сохраняем без вектора — хотя бы текст будет
                 memory_ref = self.db.collection('users').document(str(user_id)).collection('memory')
                 await memory_ref.add({
                     'content': content,
