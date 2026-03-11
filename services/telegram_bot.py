@@ -1016,44 +1016,58 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """
             Обрабатывает изображения от пользователя.
+            В bulk-режиме: описывает фото через AI и сохраняет описание в память.
             """
             user = update.effective_user
             logger.info(f"Получено фото от {user.id}")
-            
+
             if not ai_engine:
                 await update.message.reply_text("❌ Сервис ИИ временно недоступен.")
                 return
-            
+
             # Показываем индикатор "печатает"
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            
+
             try:
                 # Получаем самое большое изображение
-                photo = update.message.photo[-1]  # Последний элемент = максимальный размер
+                photo = update.message.photo[-1]
                 file = await photo.get_file()
-                
-                # Скачиваем изображение
                 image_bytes = await file.download_as_bytearray()
-                
-                # Получаем caption (текст к фото) если есть
                 caption = update.message.caption or ""
-                
-                # Получаем профиль пользователя для контекста
+
+                if user.id in bulk_mode_users:
+                    # Bulk-режим: описываем фото коротко и сохраняем в память
+                    if memory_service:
+                        import asyncio
+                        # Получаем описание через AI (короткое)
+                        description = await ai_engine.analyze_image(
+                            bytes(image_bytes),
+                            user_message=caption or "Кратко опиши что на изображении (2-3 предложения).",
+                            user_profile=None,
+                            user_name=user.first_name
+                        )
+                        content = f"[Фото] {caption + ': ' if caption else ''}{description}"
+                        asyncio.create_task(memory_service.store_message(user.id, "user", content))
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
+                        await update.message.reply_text("✅ Фото сохранено в память")
+                    else:
+                        await update.message.reply_text("❌ Memory Service не доступен.")
+                    return
+
+                # Обычный режим
                 user_data = await db_service.get_user(user.id)
                 user_profile = user_data if user_data else None
-                
-                # Анализируем изображение
+
                 response_text = await ai_engine.analyze_image(
                     bytes(image_bytes),
                     user_message=caption,
                     user_profile=user_profile,
                     user_name=user.first_name
                 )
-                
-                # Форматируем и отправляем ответ
+
                 formatted_response = markdown_to_telegram_html(response_text)
                 await send_long_message(update.message, formatted_response)
-                
+
             except Exception as e:
                 logger.error(f"Ошибка обработки фото от {user.id}: {e}")
                 await update.message.reply_text("❌ Не удалось обработать изображение.")
