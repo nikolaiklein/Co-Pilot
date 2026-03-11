@@ -2,6 +2,8 @@ import os
 import logging
 import io
 import re
+import csv
+import json
 import html
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -122,9 +124,28 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 return True
             return user_id in allowed_users
 
+        # Множество пользователей в режиме bulk-загрузки
+        bulk_mode_users: dict[int, int] = {}  # user_id -> count загруженных записей
+
         # Общая функция для обработки логики диалога (используется для текста и голоса)
         async def process_dialog_turn(user, chat_id, user_text, context):
             try:
+                # 0. Режим bulk-загрузки: сохраняем в память без AI
+                if user.id in bulk_mode_users:
+                    if memory_service:
+                        import asyncio
+                        asyncio.create_task(memory_service.store_message(user.id, "user", user_text))
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
+                        count = bulk_mode_users[user.id]
+                        # Отвечаем кратко каждые 5 сообщений, иначе тихо
+                        if count % 5 == 0:
+                            await context.bot.send_message(chat_id=chat_id, text=f"✅ Загружено: {count}")
+                        else:
+                            await context.bot.send_message(chat_id=chat_id, text="✅")
+                    else:
+                        await context.bot.send_message(chat_id=chat_id, text="❌ Memory Service не доступен.")
+                    return
+
                 # 1. Получаем или создаем пользователя в БД
                 user_data = {
                     "id": user.id,
@@ -352,6 +373,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 /myprofile — посмотреть моё досье (навыки, интересы, мечты)
 /model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
 /memory — статистика и поиск по долговременной памяти
+/bulk — режим массовой загрузки данных (текст, файлы)
 /name — дать мне имя (например: /name Макс)
 /correct — исправить ошибку в профиле
 /clear — очистить историю диалога
@@ -712,6 +734,208 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         application.add_handler(CommandHandler("memory", handle_memory))
 
+        async def handle_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /bulk — режим массовой загрузки данных.
+            /bulk — включить/выключить режим
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            if not memory_service:
+                await update.message.reply_text("❌ Memory Service не инициализирован.")
+                return
+
+            if user.id in bulk_mode_users:
+                # Выключаем режим
+                count = bulk_mode_users.pop(user.id, 0)
+                await update.message.reply_text(
+                    f"📴 <b>Режим загрузки выключен</b>\n\n"
+                    f"📊 Загружено записей: {count}\n"
+                    f"Все данные сохранены с эмбеддингами и доступны для поиска.\n\n"
+                    f"Проверь: /memory",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # Включаем режим
+                bulk_mode_users[user.id] = 0
+                await update.message.reply_text(
+                    "📥 <b>Режим массовой загрузки ВКЛЮЧЁН</b>\n\n"
+                    "Теперь можешь отправлять данные пачкой — текст, голосовые, файлы.\n"
+                    "ИИ не будет отвечать, всё сохраняется напрямую в долговременную память "
+                    "с векторными эмбеддингами.\n\n"
+                    "📎 <b>Поддерживаемые файлы:</b>\n"
+                    "  • TXT — текстовые файлы\n"
+                    "  • PDF — документы\n"
+                    "  • DOCX — Word-документы\n"
+                    "  • CSV — таблицы (сохраняются построчно)\n"
+                    "  • JSON — данные\n\n"
+                    "Для выхода из режима: /bulk",
+                    parse_mode=ParseMode.HTML
+                )
+
+        application.add_handler(CommandHandler("bulk", handle_bulk))
+
+        async def extract_text_from_file(file_bytes: bytes, file_name: str) -> str | None:
+            """Извлекает текст из файла по расширению."""
+            ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else ''
+
+            try:
+                if ext == 'txt':
+                    return file_bytes.decode('utf-8', errors='replace')
+
+                elif ext == 'pdf':
+                    try:
+                        from PyPDF2 import PdfReader
+                        reader = PdfReader(io.BytesIO(file_bytes))
+                        pages = []
+                        for page in reader.pages:
+                            text = page.extract_text()
+                            if text:
+                                pages.append(text)
+                        return '\n\n'.join(pages) if pages else None
+                    except ImportError:
+                        logger.warning("PyPDF2 не установлен, PDF не поддерживается")
+                        return None
+
+                elif ext == 'docx':
+                    try:
+                        from docx import Document
+                        doc = Document(io.BytesIO(file_bytes))
+                        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                        return '\n\n'.join(paragraphs) if paragraphs else None
+                    except ImportError:
+                        logger.warning("python-docx не установлен, DOCX не поддерживается")
+                        return None
+
+                elif ext == 'csv':
+                    text = file_bytes.decode('utf-8', errors='replace')
+                    return text  # Сохраняем CSV как текст
+
+                elif ext == 'json':
+                    data = json.loads(file_bytes.decode('utf-8', errors='replace'))
+                    return json.dumps(data, ensure_ascii=False, indent=2)
+
+                else:
+                    # Пробуем как текст
+                    decoded = file_bytes.decode('utf-8', errors='strict')
+                    return decoded
+            except Exception as e:
+                logger.error(f"Ошибка извлечения текста из {file_name}: {e}")
+                return None
+
+        async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает загруженные файлы/документы.
+            В bulk-режиме: извлекает текст и сохраняет в память.
+            В обычном режиме: извлекает текст и обрабатывает как сообщение.
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            document = update.message.document
+            if not document:
+                return
+
+            file_name = document.file_name or "unknown"
+            file_size = document.file_size or 0
+            logger.info(f"Получен документ от {user.id}: {file_name} ({file_size} bytes)")
+
+            # Ограничение размера (10MB)
+            if file_size > 10 * 1024 * 1024:
+                await update.message.reply_text("❌ Файл слишком большой (макс. 10 МБ).")
+                return
+
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+                # Скачиваем файл
+                file = await document.get_file()
+                with io.BytesIO() as buffer:
+                    await file.download_to_memory(out=buffer)
+                    buffer.seek(0)
+                    file_bytes = buffer.read()
+
+                # Извлекаем текст
+                text = await extract_text_from_file(file_bytes, file_name)
+
+                if not text or len(text.strip()) < 5:
+                    await update.message.reply_text(
+                        f"⚠️ Не удалось извлечь текст из <code>{file_name}</code>.\n"
+                        "Поддерживаемые форматы: TXT, PDF, DOCX, CSV, JSON",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+
+                caption = update.message.caption or ""
+
+                if user.id in bulk_mode_users:
+                    # Bulk-режим: сохраняем в память напрямую
+                    if memory_service:
+                        import asyncio
+                        # Разбиваем длинные тексты на чанки по ~1500 символов
+                        chunks = _split_text_to_chunks(text, max_len=1500)
+                        for chunk in chunks:
+                            content = f"[Файл: {file_name}] {chunk}"
+                            asyncio.create_task(memory_service.store_message(user.id, "user", content))
+
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + len(chunks)
+                        await update.message.reply_text(
+                            f"✅ <code>{file_name}</code> — {len(chunks)} фрагмент(ов), "
+                            f"{len(text)} символов",
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        await update.message.reply_text("❌ Memory Service не доступен.")
+                else:
+                    # Обычный режим: обрабатываем как текстовое сообщение
+                    # Обрезаем для AI (макс ~3000 символов)
+                    truncated = text[:3000]
+                    user_text = f"[Файл: {file_name}] {caption}\n\n{truncated}" if caption else f"[Файл: {file_name}]\n\n{truncated}"
+                    if len(text) > 3000:
+                        user_text += f"\n\n... (обрезано, всего {len(text)} символов)"
+                    await process_dialog_turn(user, update.effective_chat.id, user_text, context)
+
+            except Exception as e:
+                logger.error(f"Ошибка обработки документа от {user.id}: {e}")
+                await update.message.reply_text(f"❌ Ошибка обработки файла: {e}")
+
+        def _split_text_to_chunks(text: str, max_len: int = 1500) -> list[str]:
+            """Разбивает текст на чанки для эмбеддинга."""
+            if len(text) <= max_len:
+                return [text]
+
+            chunks = []
+            paragraphs = text.split('\n\n')
+            current = ""
+
+            for para in paragraphs:
+                if len(current) + len(para) + 2 <= max_len:
+                    current += para + "\n\n"
+                else:
+                    if current.strip():
+                        chunks.append(current.strip())
+                    # Если абзац сам длиннее max_len — нарезаем по предложениям
+                    if len(para) > max_len:
+                        words = para.split()
+                        current = ""
+                        for word in words:
+                            if len(current) + len(word) + 1 <= max_len:
+                                current += word + " "
+                            else:
+                                if current.strip():
+                                    chunks.append(current.strip())
+                                current = word + " "
+                    else:
+                        current = para + "\n\n"
+
+            if current.strip():
+                chunks.append(current.strip())
+
+            return chunks if chunks else [text[:max_len]]
+
         async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """
             Обрабатывает нажатия на inline-кнопки.
@@ -845,6 +1069,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         # Регистрируем обработчик фото
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+        # Регистрируем обработчик документов/файлов
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
         # Инициализируем приложение
         await application.initialize()
