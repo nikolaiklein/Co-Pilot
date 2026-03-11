@@ -367,17 +367,25 @@ PROVIDER_MAP = {
 }
 
 # Провайдеры с OpenAI-совместимым API
+# Все модели NVIDIA NIM доступны через единый endpoint
 OPENAI_COMPATIBLE_PROVIDERS = {
     "nvidia": {
         "env_key": "NVIDIA_API_KEY",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "default_model": "meta/llama-4-maverick-17b-128e-instruct",
     },
-    "minimax": {
-        "env_key": "MINIMAX_API_KEY",
-        "base_url": "https://api.minimax.chat/v1",
-        "default_model": "minimaxai/minimax-m2.5",
-    },
+}
+
+# Модели доступные через NVIDIA NIM (проверенные, рабочие)
+NVIDIA_MODELS = {
+    "llama-4-maverick": "meta/llama-4-maverick-17b-128e-instruct",
+    "kimi-k2": "moonshotai/kimi-k2-instruct",
+    "kimi-k2.5": "moonshotai/kimi-k2.5",
+    "deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
+    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
+    "nemotron-ultra": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "mistral-large-3": "mistralai/mistral-large-3-675b-instruct-2512",
+    "minimax-m2.5": "minimaxai/minimax-m2.5",
 }
 
 DEFAULT_MODELS = {
@@ -385,18 +393,40 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
     "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
-    "minimax": "minimaxai/minimax-m2.5",
 }
 
 def parse_model_string(model_string: str) -> tuple[str, str]:
     """
-    Парсит строку формата 'provider/model' в кортеж (provider, model).
-    Пример: 'gemini/gemini-2.5-flash' -> ('gemini', 'gemini-2.5-flash')
+    Парсит строку модели в кортеж (provider, model).
+
+    Поддерживает форматы:
+    - 'gemini/gemini-2.5-flash' -> ('gemini', 'gemini-2.5-flash')
+    - 'gemini' -> ('gemini', 'gemini-2.5-flash')  # дефолтная модель провайдера
+    - 'kimi-k2' -> ('nvidia', 'moonshotai/kimi-k2-instruct')  # короткое имя NVIDIA модели
+    - 'nvidia/moonshotai/kimi-k2-instruct' -> ('nvidia', 'moonshotai/kimi-k2-instruct')
     """
-    if '/' in model_string:
-        provider, model = model_string.split('/', 1)
-        return provider.lower(), model
-    return model_string.lower(), DEFAULT_MODELS.get(model_string.lower(), model_string)
+    ms = model_string.strip().lower()
+
+    # Проверяем короткие имена NVIDIA моделей (kimi-k2, qwen3.5-397b и т.д.)
+    if ms in NVIDIA_MODELS:
+        return "nvidia", NVIDIA_MODELS[ms]
+
+    if '/' in ms:
+        # nvidia/moonshotai/kimi-k2-instruct -> provider=nvidia, model=moonshotai/kimi-k2-instruct
+        parts = ms.split('/', 1)
+        provider = parts[0]
+        model = parts[1]
+        # Если провайдер nvidia и передали полное имя модели — используем как есть
+        if provider in DEFAULT_MODELS or provider in OPENAI_COMPATIBLE_PROVIDERS:
+            return provider, model
+        # Иначе это может быть полное имя NVIDIA модели (org/model)
+        # Проверяем, есть ли такая в NVIDIA_MODELS values
+        if ms in NVIDIA_MODELS.values():
+            return "nvidia", ms
+        # Fallback: первая часть = provider
+        return provider, model
+
+    return ms, DEFAULT_MODELS.get(ms, ms)
 
 
 def create_provider(provider_name: str, model: str) -> BaseProvider:
@@ -452,7 +482,8 @@ class AIEngine:
         provider_name, model = parse_model_string(default)
 
         try:
-            self.providers[provider_name] = create_provider(provider_name, model)
+            cache_key = f"{provider_name}:{model}"
+            self.providers[cache_key] = create_provider(provider_name, model)
             self.default_provider_name = provider_name
             self.default_model = model
             logger.info(f"AI Engine: провайдер по умолчанию — {provider_name}/{model}")
@@ -460,7 +491,7 @@ class AIEngine:
             logger.warning(f"Не удалось создать провайдер по умолчанию: {e}")
 
         # Для обратной совместимости: self.client != None означает, что движок готов
-        self.client = self.providers.get(self.default_provider_name)
+        self.client = self.providers.get(f"{self.default_provider_name}:{self.default_model}")
 
     def get_provider(self, provider_name: str = None, model: str = None) -> BaseProvider:
         """Возвращает провайдер. Если не указан — дефолтный."""
@@ -469,10 +500,13 @@ class AIEngine:
         if not model:
             model = DEFAULT_MODELS.get(provider_name, "")
 
-        if provider_name not in self.providers:
-            self.providers[provider_name] = create_provider(provider_name, model)
+        # Ключ кеша: provider+model (разные модели одного провайдера = разные экземпляры)
+        cache_key = f"{provider_name}:{model}"
 
-        return self.providers[provider_name]
+        if cache_key not in self.providers:
+            self.providers[cache_key] = create_provider(provider_name, model)
+
+        return self.providers[cache_key]
 
     async def generate_response(
         self,

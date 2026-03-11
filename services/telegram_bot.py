@@ -544,10 +544,13 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             """
             Обрабатывает команду /model — переключение AI-модели.
             /model — показать текущую и доступные
-            /model gemini — переключить на Gemini
-            /model nvidia/meta/llama-4-maverick-17b-128e-instruct — конкретная модель
+            /model kimi-k2 — переключить по короткому имени
+            /model gemini/gemini-2.5-pro — переключить на конкретную
             """
-            from services.ai_engine import DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP, parse_model_string
+            from services.ai_engine import (
+                DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP,
+                NVIDIA_MODELS, parse_model_string, create_provider,
+            )
             user = update.effective_user
             if not is_authorized(user.id):
                 return
@@ -555,18 +558,29 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             args = context.args
 
             if not args:
-                # Показать текущую модель и список доступных
                 current = f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
 
                 lines = [f"⚙️ <b>Текущая модель:</b> <code>{current}</code>\n"]
-                lines.append("<b>Доступные модели:</b>\n")
 
-                for provider, model in DEFAULT_MODELS.items():
-                    marker = " ✅" if provider == ai_engine.default_provider_name else ""
-                    lines.append(f"  <code>{provider}/{model}</code>{marker}")
+                # Gemini
+                lines.append("🔵 <b>Gemini:</b>")
+                for m in ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]:
+                    marker = " ✅" if ai_engine.default_model == m else ""
+                    lines.append(f"  <code>/model gemini/{m}</code>{marker}")
 
-                lines.append(f"\n💡 Переключить: <code>/model провайдер</code>")
-                lines.append(f"Пример: <code>/model anthropic</code>")
+                # NVIDIA NIM models
+                lines.append("\n🟢 <b>NVIDIA NIM:</b>")
+                for short_name, full_name in NVIDIA_MODELS.items():
+                    marker = " ✅" if ai_engine.default_model == full_name else ""
+                    lines.append(f"  <code>/model {short_name}</code> → {full_name}{marker}")
+
+                # Anthropic / OpenAI (если ключи есть)
+                if os.getenv("ANTHROPIC_API_KEY") and os.getenv("ANTHROPIC_API_KEY") != "placeholder":
+                    lines.append("\n🟣 <b>Anthropic:</b>")
+                    lines.append("  <code>/model anthropic</code>")
+                if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_KEY") != "placeholder":
+                    lines.append("\n⚪ <b>OpenAI:</b>")
+                    lines.append("  <code>/model openai</code>")
 
                 await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
                 return
@@ -578,8 +592,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             all_providers = set(PROVIDER_MAP.keys()) | set(OPENAI_COMPATIBLE_PROVIDERS.keys())
             if provider_name not in all_providers:
                 await update.message.reply_text(
-                    f"❌ Неизвестный провайдер: <code>{provider_name}</code>\n\n"
-                    f"Доступные: {', '.join(sorted(all_providers))}",
+                    f"❌ Неизвестный провайдер или модель: <code>{model_string}</code>\n\n"
+                    f"Используй /model чтобы увидеть список.",
                     parse_mode=ParseMode.HTML
                 )
                 return
