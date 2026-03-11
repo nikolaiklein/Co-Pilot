@@ -351,6 +351,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 /help — показать это сообщение
 /myprofile — посмотреть моё досье (навыки, интересы, мечты)
 /model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
+/memory — статистика и поиск по долговременной памяти
 /name — дать мне имя (например: /name Макс)
 /correct — исправить ошибку в профиле
 /clear — очистить историю диалога
@@ -639,6 +640,77 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.HTML)
 
         application.add_handler(CommandHandler("model", handle_model))
+
+        async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /memory — тест и статистика долговременной памяти.
+            /memory — показать статистику
+            /memory search запрос — поиск по памяти
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            if not memory_service:
+                await update.message.reply_text("❌ Memory Service не инициализирован.")
+                return
+
+            args = context.args or []
+
+            if args and args[0] == "search" and len(args) > 1:
+                # Поиск по памяти
+                query = " ".join(args[1:])
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+                results = await memory_service.search_memory(user.id, query, limit=5)
+
+                if not results:
+                    await update.message.reply_text(f"🔍 По запросу «{query}» ничего не найдено в памяти.")
+                    return
+
+                text = f"🔍 <b>Результаты поиска:</b> «{query}»\n\n"
+                for i, r in enumerate(results, 1):
+                    role_label = "👤" if r['role'] == 'user' else "🤖"
+                    prefix = "[📋 Конспект] " if r.get('summary_block') else ""
+                    content_preview = r['content'][:200]
+                    text += f"{i}. {role_label} {prefix}{content_preview}\n\n"
+
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            else:
+                # Статистика памяти
+                try:
+                    from google.cloud import firestore as fs
+                    memory_ref = memory_service.db.collection('users').document(str(user.id)).collection('memory')
+
+                    # Считаем документы
+                    all_docs = await memory_ref.limit(500).get()
+                    total = len(all_docs)
+
+                    user_msgs = sum(1 for d in all_docs if d.to_dict().get('role') == 'user')
+                    assistant_msgs = sum(1 for d in all_docs if d.to_dict().get('role') == 'assistant')
+                    summaries = sum(1 for d in all_docs if d.to_dict().get('summary_block'))
+                    with_embedding = sum(1 for d in all_docs if d.to_dict().get('embedding'))
+
+                    text = f"""🧠 <b>Долговременная память</b>
+
+📊 <b>Статистика:</b>
+  Всего записей: {total}
+  👤 Пользователь: {user_msgs}
+  🤖 Ассистент: {assistant_msgs}
+  📋 Конспектов: {summaries}
+  🔢 С эмбеддингом: {with_embedding}
+
+💡 <b>Команды:</b>
+  <code>/memory search запрос</code> — поиск по памяти
+
+ℹ️ Память автоматически сохраняет все сообщения и ищет релевантный контекст при триггерных словах (вспомни, помнишь, мы обсуждали...)"""
+
+                    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"Ошибка получения статистики памяти для {user.id}: {e}")
+                    await update.message.reply_text(f"❌ Ошибка: {e}")
+
+        application.add_handler(CommandHandler("memory", handle_memory))
 
         async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """

@@ -277,6 +277,51 @@ async def send_weekly_digest():
         logger.error(f"Ошибка отправки weekly digest: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/debug/memory/{user_id}")
+async def debug_memory(user_id: int, q: str = ""):
+    """
+    Отладочный эндпоинт для проверки памяти пользователя.
+    GET /debug/memory/123 — статистика
+    GET /debug/memory/123?q=тема — поиск по памяти
+    """
+    if not memory_service or not db_service:
+        return {"status": "error", "message": "Services not initialized"}
+
+    try:
+        memory_ref = memory_service.db.collection('users').document(str(user_id)).collection('memory')
+        all_docs = await memory_ref.limit(100).get()
+
+        stats = {
+            "total": len(all_docs),
+            "user_msgs": sum(1 for d in all_docs if d.to_dict().get('role') == 'user'),
+            "assistant_msgs": sum(1 for d in all_docs if d.to_dict().get('role') == 'assistant'),
+            "summaries": sum(1 for d in all_docs if d.to_dict().get('summary_block')),
+            "with_embedding": sum(1 for d in all_docs if d.to_dict().get('embedding')),
+        }
+
+        result = {"status": "ok", "user_id": user_id, "stats": stats}
+
+        if q:
+            search_results = await memory_service.search_memory(user_id, q, limit=5)
+            result["search_query"] = q
+            result["search_results"] = search_results
+
+        # Показать последние 5 записей
+        recent_docs = sorted(all_docs, key=lambda d: d.to_dict().get('timestamp') or '', reverse=True)[:5]
+        result["recent"] = []
+        for doc in recent_docs:
+            data = doc.to_dict()
+            result["recent"].append({
+                "role": data.get("role"),
+                "content": data.get("content", "")[:200],
+                "has_embedding": bool(data.get("embedding")),
+                "summary_block": data.get("summary_block", False),
+            })
+
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/cron/summarize-memory")
 async def summarize_memory_cron():
     """

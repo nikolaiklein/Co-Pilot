@@ -114,7 +114,7 @@ class MemoryService:
                 'timestamp': firestore.SERVER_TIMESTAMP,
                 'summary_block': False,
             })
-            logger.debug(f"Memory stored for user {user_id} (role={role})")
+            logger.info(f"✅ Memory stored for user {user_id} (role={role}, len={len(content)}, embedding_dims={len(embedding)})")
         except Exception as e:
             logger.error(f"Ошибка сохранения в memory для {user_id}: {e}")
 
@@ -168,9 +168,12 @@ class MemoryService:
         Returns:
             str: Форматированный контекст из памяти (или пустая строка).
         """
-        if not self.should_search_memory(user_text):
+        trigger_match = self.should_search_memory(user_text)
+        if not trigger_match:
+            logger.info(f"Memory: no trigger words in message from user {user_id}")
             return ""
 
+        logger.info(f"Memory: trigger detected for user {user_id}, searching...")
         results = await self.search_memory(user_id, user_text, limit=5)
         if not results:
             return ""
