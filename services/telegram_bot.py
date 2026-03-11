@@ -552,7 +552,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             """
             from services.ai_engine import (
                 DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP,
-                NVIDIA_MODELS, parse_model_string, create_provider,
+                NVIDIA_MODELS, GEMINI_MODELS, parse_model_string, create_provider,
             )
             user = update.effective_user
             if not is_authorized(user.id):
@@ -571,9 +571,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
                 # Gemini
                 lines.append("🔵 <b>Gemini:</b>")
-                for m in ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]:
-                    marker = " ✅" if ai_engine.default_model == m else ""
-                    lines.append(f"  <code>/model gemini/{m}</code>{marker}")
+                for short_name, full_name in GEMINI_MODELS.items():
+                    marker = " ✅" if current.endswith(full_name) else ""
+                    lines.append(f"  <code>/model {short_name}</code>{marker}")
 
                 # NVIDIA NIM models
                 lines.append("\n🟢 <b>NVIDIA NIM:</b>")

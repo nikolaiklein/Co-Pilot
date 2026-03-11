@@ -388,8 +388,20 @@ NVIDIA_MODELS = {
     "minimax-m2.5": "minimaxai/minimax-m2.5",
 }
 
+# Доступные Gemini модели (проверенные, рабочие)
+GEMINI_MODELS = {
+    "gemini-3-flash": "gemini-3-flash-preview",
+    "gemini-3-pro": "gemini-3-pro-preview",
+    "gemini-3.1-pro": "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash": "gemini-2.5-flash",
+    "gemini-2.5-pro": "gemini-2.5-pro",
+    "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+    "gemini-2.0-flash": "gemini-2.0-flash",
+}
+
 DEFAULT_MODELS = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3-flash-preview",
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
     "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
@@ -406,6 +418,10 @@ def parse_model_string(model_string: str) -> tuple[str, str]:
     - 'nvidia/moonshotai/kimi-k2-instruct' -> ('nvidia', 'moonshotai/kimi-k2-instruct')
     """
     ms = model_string.strip().lower()
+
+    # Проверяем короткие имена Gemini моделей
+    if ms in GEMINI_MODELS:
+        return "gemini", GEMINI_MODELS[ms]
 
     # Проверяем короткие имена NVIDIA моделей (kimi-k2, qwen3.5-397b и т.д.)
     if ms in NVIDIA_MODELS:
