@@ -168,10 +168,12 @@ class GeminiProvider(BaseProvider):
 
     async def transcribe_audio(self, file_bytes: bytes) -> str:
         audio_part = self.types.Part.from_bytes(data=file_bytes, mime_type="audio/ogg")
-        prompt = "Пожалуйста, дословно транскрибируй этот аудиофайл в текст. Если аудио пустое или неразборчивое, напиши '[Не удалось распознать речь]'."
+        prompt = "Дословно транскрибируй аудио в текст. Выведи ТОЛЬКО текст речи, без пояснений, без кавычек, без префиксов. Если неразборчиво — '[Не удалось распознать речь]'."
 
+        # Используем gemini-2.0-flash для транскрипции — он стабильнее и не "думает вслух"
+        transcribe_model = "gemini-2.0-flash"
         response = await self.client.aio.models.generate_content(
-            model=self.model,
+            model=transcribe_model,
             contents=[self.types.Content(
                 role="user",
                 parts=[self.types.Part.from_text(text=prompt), audio_part]
