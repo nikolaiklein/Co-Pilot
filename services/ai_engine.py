@@ -306,6 +306,57 @@ class OpenAIProvider(BaseProvider):
         return (response.choices[0].message.content or "").strip()
 
 
+# --- OpenAI-совместимый провайдер (NVIDIA, MiniMax и др.) ---
+
+class OpenAICompatibleProvider(BaseProvider):
+    """Провайдер для любого OpenAI-совместимого API (NVIDIA, MiniMax и др.)."""
+
+    def __init__(self, api_key: str, model: str, base_url: str):
+        import openai
+        self.client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        logger.info(f"OpenAICompatibleProvider инициализирован (модель: {model}, endpoint: {base_url})")
+
+    async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
+        api_messages = [{"role": "system", "content": system_prompt}]
+        for msg in messages:
+            role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
+            api_messages.append({"role": role, "content": msg['content']})
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=api_messages,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
+
+    async def analyze(self, prompt: str) -> str:
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
+        import base64
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        })
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+
 # --- Фабрика провайдеров ---
 
 PROVIDER_MAP = {
@@ -314,10 +365,26 @@ PROVIDER_MAP = {
     "openai": OpenAIProvider,
 }
 
+# Провайдеры с OpenAI-совместимым API
+OPENAI_COMPATIBLE_PROVIDERS = {
+    "nvidia": {
+        "env_key": "NVIDIA_API_KEY",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "default_model": "meta/llama-4-maverick-17b-128e-instruct",
+    },
+    "minimax": {
+        "env_key": "MINIMAX_API_KEY",
+        "base_url": "https://api.minimax.chat/v1",
+        "default_model": "minimaxai/minimax-m2.5",
+    },
+}
+
 DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
+    "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
+    "minimax": "minimaxai/minimax-m2.5",
 }
 
 def parse_model_string(model_string: str) -> tuple[str, str]:
@@ -333,11 +400,26 @@ def parse_model_string(model_string: str) -> tuple[str, str]:
 
 def create_provider(provider_name: str, model: str) -> BaseProvider:
     """Создаёт экземпляр провайдера по имени."""
+    # Стандартные провайдеры
     key_map = {
         "gemini": "GEMINI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "openai": "OPENAI_API_KEY",
     }
+
+    # OpenAI-совместимые провайдеры
+    if provider_name in OPENAI_COMPATIBLE_PROVIDERS:
+        config = OPENAI_COMPATIBLE_PROVIDERS[provider_name]
+        api_key = os.getenv(config["env_key"])
+        if not api_key:
+            raise ValueError(f"API ключ {config['env_key']} не задан")
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            model=model,
+            base_url=config["base_url"],
+        )
+
+    # Стандартные провайдеры
     env_var = key_map.get(provider_name)
     if not env_var:
         raise ValueError(f"Неизвестный провайдер: {provider_name}")
