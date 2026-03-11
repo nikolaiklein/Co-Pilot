@@ -8,6 +8,7 @@ from services.db import DatabaseService
 from services.telegram_bot import create_bot_app
 from services.ai_engine import AIEngine
 from services.analyzer import AnalyzerService
+from services.memory import MemoryService
 
 # Настройка базового логирования
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,7 @@ db_service = None
 bot_app = None
 ai_engine = None
 analyzer_service = None
+memory_service = None
 
 # Событие запуска приложения
 @app.on_event("startup")
@@ -38,7 +40,7 @@ async def startup_event():
     Выполняется при старте приложения.
     Здесь происходит инициализация внешних сервисов: Firebase, DB, AI, Bot.
     """
-    global db_service, bot_app, ai_engine, analyzer_service
+    global db_service, bot_app, ai_engine, analyzer_service, memory_service
     logger.info("Запуск приложения...")
 
     # 1. Инициализация Firebase Admin
@@ -63,7 +65,18 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации AIEngine: {e}")
 
-    # 4. Инициализация Analyzer Service (до бота, чтобы передать ему)
+    # 4. Инициализация Memory Service
+    try:
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if db_service and db_service.db and gemini_key:
+            memory_service = MemoryService(db_service.db, gemini_key)
+            logger.info("Memory Service инициализирован.")
+        else:
+            logger.warning("Memory Service не инициализирован (нет DB или GEMINI_API_KEY).")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Memory Service: {e}")
+
+    # 6. Инициализация Analyzer Service
     try:
         if db_service and ai_engine:
             analyzer_service = AnalyzerService(db_service, ai_engine)
@@ -73,10 +86,9 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации Analyzer Service: {e}")
 
-    # 5. Инициализация Telegram Bot Application
+    # 7. Инициализация Telegram Bot Application
     try:
-        # Передаем db_service, ai_engine и analyzer_service в функцию создания бота
-        bot_app = await create_bot_app(db_service, ai_engine, analyzer_service)
+        bot_app = await create_bot_app(db_service, ai_engine, analyzer_service, memory_service)
         if bot_app:
              await bot_app.start()
              logger.info("Telegram Bot запущен.")
@@ -90,7 +102,9 @@ async def shutdown_event():
     Выполняется при остановке приложения.
     Корректное завершение работы бота.
     """
-    global bot_app
+    global bot_app, memory_service
+    if memory_service:
+        await memory_service.close()
     if bot_app:
         logger.info("Остановка Telegram Bot...")
         await bot_app.stop()
@@ -261,6 +275,30 @@ async def send_weekly_digest():
         
     except Exception as e:
         logger.error(f"Ошибка отправки weekly digest: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/cron/summarize-memory")
+async def summarize_memory_cron():
+    """
+    Суммаризация старых сообщений в долговременной памяти.
+    Сжимает блоки по 30 сообщений в конспекты.
+    """
+    if not memory_service or not db_service or not ai_engine:
+        return {"status": "error", "message": "Services not initialized"}
+
+    try:
+        user_ids = await db_service.get_all_user_ids()
+        summarized = 0
+        for user_id in user_ids:
+            try:
+                await memory_service.summarize_old_messages(user_id, ai_engine)
+                summarized += 1
+            except Exception as e:
+                logger.warning(f"Ошибка суммаризации памяти для {user_id}: {e}")
+
+        return {"status": "ok", "users_processed": summarized}
+    except Exception as e:
+        logger.error(f"Ошибка cron summarize-memory: {e}")
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":

@@ -85,7 +85,7 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list:
 # Однако, для чистоты, будем использовать Any или просто duck typing.
 # from services.ai_engine import AIEngine
 
-async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None) -> Application:
+async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None, memory_service=None) -> Application:
     """
     Создает и настраивает приложение Telegram бота.
     Регистрирует обработчики сообщений.
@@ -154,25 +154,44 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 # 5. Определяем провайдер пользователя (сохранённый в БД)
                 from services.ai_engine import parse_model_string
                 user_provider = None
+                user_model = None
                 user_model_str = db_user.get('selected_model') if db_user else None
                 if user_model_str:
-                    user_provider, _ = parse_model_string(user_model_str)
+                    user_provider, user_model = parse_model_string(user_model_str)
 
-                # 6. Генерируем ответ
+                # 5.1. Долговременная память: поиск релевантного контекста
+                memory_context = ""
+                if memory_service:
+                    try:
+                        memory_context = await memory_service.get_memory_context(user.id, user_text)
+                    except Exception as mem_err:
+                        logger.warning(f"Memory search error: {mem_err}")
+
+                # 6. Генерируем ответ (с контекстом памяти)
+                augmented_text = user_text
+                if memory_context:
+                    augmented_text = f"{memory_context}\n{user_text}"
+
                 response_text = await ai_engine.generate_response(
                     user_id=user.id,
-                    user_text=user_text,
+                    user_text=augmented_text,
                     history=history_for_ai,
                     user_profile=db_user,
                     user_name=user.first_name,
                     provider_name=user_provider,
-                    model=_ if user_model_str else None,
+                    model=user_model,
                 )
 
                 # 6. Сохраняем ответ ассистента
                 await db_service.save_message(user.id, "assistant", response_text)
 
-                # 6.1 Запускаем анализ профиля после каждых 3 сообщений пользователя
+                # 6.1 Сохраняем в долговременную память (фоново)
+                if memory_service:
+                    import asyncio
+                    asyncio.create_task(memory_service.store_message(user.id, "user", user_text))
+                    asyncio.create_task(memory_service.store_message(user.id, "assistant", response_text))
+
+                # 6.2 Запускаем анализ профиля после каждых 3 сообщений пользователя
                 if analyzer_service:
                     try:
                         # Считаем сообщения пользователя в истории
