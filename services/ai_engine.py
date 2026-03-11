@@ -55,6 +55,7 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str
 
 ## Доступные команды (напоминай при необходимости)
 - /myprofile — посмотреть своё досье
+- /model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
 - /name — дать боту персональное имя
 - /correct — исправить ошибку в профиле
 - /clear — очистить историю диалога

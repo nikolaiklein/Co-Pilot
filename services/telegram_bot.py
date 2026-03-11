@@ -328,6 +328,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 /start — начать работу с ботом
 /help — показать это сообщение
 /myprofile — посмотреть моё досье (навыки, интересы, мечты)
+/model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
 /name — дать мне имя (например: /name Макс)
 /correct — исправить ошибку в профиле
 /clear — очистить историю диалога
@@ -538,6 +539,66 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         # Регистрируем обработчик команды /correct
         application.add_handler(CommandHandler("correct", handle_correct))
+
+        async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /model — переключение AI-модели.
+            /model — показать текущую и доступные
+            /model gemini — переключить на Gemini
+            /model nvidia/meta/llama-4-maverick-17b-128e-instruct — конкретная модель
+            """
+            from services.ai_engine import DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP, parse_model_string
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            args = context.args
+
+            if not args:
+                # Показать текущую модель и список доступных
+                current = f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
+
+                lines = [f"⚙️ <b>Текущая модель:</b> <code>{current}</code>\n"]
+                lines.append("<b>Доступные модели:</b>\n")
+
+                for provider, model in DEFAULT_MODELS.items():
+                    marker = " ✅" if provider == ai_engine.default_provider_name else ""
+                    lines.append(f"  <code>{provider}/{model}</code>{marker}")
+
+                lines.append(f"\n💡 Переключить: <code>/model провайдер</code>")
+                lines.append(f"Пример: <code>/model anthropic</code>")
+
+                await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+                return
+
+            model_string = " ".join(args).strip()
+            provider_name, model = parse_model_string(model_string)
+
+            # Проверяем, что провайдер существует
+            all_providers = set(PROVIDER_MAP.keys()) | set(OPENAI_COMPATIBLE_PROVIDERS.keys())
+            if provider_name not in all_providers:
+                await update.message.reply_text(
+                    f"❌ Неизвестный провайдер: <code>{provider_name}</code>\n\n"
+                    f"Доступные: {', '.join(sorted(all_providers))}",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            try:
+                # Пробуем создать провайдер (проверяем наличие ключа)
+                ai_engine.get_provider(provider_name, model)
+                ai_engine.default_provider_name = provider_name
+                ai_engine.default_model = model
+                ai_engine.client = ai_engine.providers.get(provider_name)
+
+                await update.message.reply_text(
+                    f"✅ Модель переключена на <code>{provider_name}/{model}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            except ValueError as e:
+                await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.HTML)
+
+        application.add_handler(CommandHandler("model", handle_model))
 
         async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """

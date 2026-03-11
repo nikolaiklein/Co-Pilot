@@ -56,6 +56,8 @@ jobs:
           GEMINI_API_KEY=GEMINI_API_KEY:latest,\
           ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest,\
           OPENAI_API_KEY=OPENAI_API_KEY:latest,\
+          NVIDIA_API_KEY=NVIDIA_API_KEY:latest,\
+          MINIMAX_API_KEY=MINIMAX_API_KEY:latest,\
           ALLOWED_USERS=ALLOWED_USERS:latest,\
           DEFAULT_MODEL=DEFAULT_MODEL:latest"
 
