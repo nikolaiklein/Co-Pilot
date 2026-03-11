@@ -516,10 +516,11 @@ class AIEngine:
         user_profile: dict = None,
         user_name: str = None,
         provider_name: str = None,
+        model: str = None,
     ) -> str:
         """Генерирует ответ ИИ с учётом истории и профиля пользователя."""
         try:
-            provider = self.get_provider(provider_name)
+            provider = self.get_provider(provider_name, model)
         except ValueError as e:
             logger.error(f"Провайдер недоступен: {e}")
             return "Извините, сервис ИИ временно недоступен."

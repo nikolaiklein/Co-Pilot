@@ -134,7 +134,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     "language_code": user.language_code,
                     "is_bot": user.is_bot
                 }
-                await db_service.get_or_create_user(user.id, user_data)
+                db_user = await db_service.get_or_create_user(user.id, user_data)
 
                 # 2. Сохраняем сообщение пользователя
                 await db_service.save_message(user.id, "user", user_text)
@@ -151,19 +151,22 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 else:
                      history_for_ai = history
 
-                # 5. Генерируем ответ, передавая профиль пользователя для динамического промпта
-                # user_data уже содержит profile_summary, если оно есть
-                # Но лучше явно получить свежий профиль, так как user_data выше был для get_or_create (инициализации)
-                # Хотя get_or_create возвращает актуальные данные, но если анализ прошел в фоне, profile_summary может обновиться
-                # Для надежности возьмем текущий профиль из user_data, а если там пусто - то из БД заново (но это лишний запрос).
-                # Пока используем то, что вернул get_or_create_user - это эффективно.
-                
+                # 5. Определяем провайдер пользователя (сохранённый в БД)
+                from services.ai_engine import parse_model_string
+                user_provider = None
+                user_model_str = db_user.get('selected_model') if db_user else None
+                if user_model_str:
+                    user_provider, _ = parse_model_string(user_model_str)
+
+                # 6. Генерируем ответ
                 response_text = await ai_engine.generate_response(
-                    user_id=user.id, 
-                    user_text=user_text, 
+                    user_id=user.id,
+                    user_text=user_text,
                     history=history_for_ai,
-                    user_profile=user_data, # Передаем весь объект пользователя, внутри есть profile_summary
-                    user_name=user.first_name
+                    user_profile=db_user,
+                    user_name=user.first_name,
+                    provider_name=user_provider,
+                    model=_ if user_model_str else None,
                 )
 
                 # 6. Сохраняем ответ ассистента
@@ -558,9 +561,13 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             args = context.args
 
             if not args:
-                current = f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
+                # Получаем персональную модель пользователя из БД
+                user_data = await db_service.get_user(user.id)
+                user_selected = user_data.get('selected_model') if user_data else None
+                current = user_selected or f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
+                suffix = "" if user_selected else " (по умолчанию)"
 
-                lines = [f"⚙️ <b>Текущая модель:</b> <code>{current}</code>\n"]
+                lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>{suffix}\n"]
 
                 # Gemini
                 lines.append("🔵 <b>Gemini:</b>")
@@ -601,9 +608,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             try:
                 # Пробуем создать провайдер (проверяем наличие ключа)
                 ai_engine.get_provider(provider_name, model)
-                ai_engine.default_provider_name = provider_name
-                ai_engine.default_model = model
-                ai_engine.client = ai_engine.providers.get(provider_name)
+
+                # Сохраняем выбор пользователя в БД
+                await db_service.update_user(user.id, {"selected_model": f"{provider_name}/{model}"})
 
                 await update.message.reply_text(
                     f"✅ Модель переключена на <code>{provider_name}/{model}</code>",
