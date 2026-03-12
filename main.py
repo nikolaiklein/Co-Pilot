@@ -65,14 +65,16 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Ошибка инициализации AIEngine: {e}")
 
-    # 4. Инициализация Memory Service
+    # 4. Инициализация Memory Service (Mem0 + Qdrant)
     try:
         gemini_key = os.getenv("GEMINI_API_KEY")
-        if db_service and db_service.db and gemini_key:
-            memory_service = MemoryService(db_service.db, gemini_key)
-            logger.info("Memory Service инициализирован.")
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        if gemini_key:
+            memory_service = MemoryService(gemini_key, qdrant_url, qdrant_api_key)
+            logger.info("Memory Service (Mem0) инициализирован.")
         else:
-            logger.warning("Memory Service не инициализирован (нет DB или GEMINI_API_KEY).")
+            logger.warning("Memory Service не инициализирован (нет GEMINI_API_KEY).")
     except Exception as e:
         logger.error(f"Ошибка инициализации Memory Service: {e}")
 
@@ -284,20 +286,12 @@ async def debug_memory(user_id: int, q: str = ""):
     GET /debug/memory/123 — статистика
     GET /debug/memory/123?q=тема — поиск по памяти
     """
-    if not memory_service or not db_service:
-        return {"status": "error", "message": "Services not initialized"}
+    if not memory_service:
+        return {"status": "error", "message": "Memory Service not initialized"}
 
     try:
-        memory_ref = memory_service.db.collection('users').document(str(user_id)).collection('memory')
-        all_docs = await memory_ref.limit(100).get()
-
-        stats = {
-            "total": len(all_docs),
-            "user_msgs": sum(1 for d in all_docs if d.to_dict().get('role') == 'user'),
-            "assistant_msgs": sum(1 for d in all_docs if d.to_dict().get('role') == 'assistant'),
-            "summaries": sum(1 for d in all_docs if d.to_dict().get('summary_block')),
-            "with_embedding": sum(1 for d in all_docs if d.to_dict().get('embedding')),
-        }
+        all_memories = await memory_service.get_all_memories(user_id, limit=100)
+        stats = {"total": len(all_memories)}
 
         result = {"status": "ok", "user_id": user_id, "stats": stats}
 
@@ -307,16 +301,10 @@ async def debug_memory(user_id: int, q: str = ""):
             result["search_results"] = search_results
 
         # Показать последние 5 записей
-        recent_docs = sorted(all_docs, key=lambda d: d.to_dict().get('timestamp') or '', reverse=True)[:5]
-        result["recent"] = []
-        for doc in recent_docs:
-            data = doc.to_dict()
-            result["recent"].append({
-                "role": data.get("role"),
-                "content": data.get("content", "")[:200],
-                "has_embedding": bool(data.get("embedding")),
-                "summary_block": data.get("summary_block", False),
-            })
+        result["recent"] = [
+            {"memory": m.get("memory", "")[:200], "id": m.get("id", "")}
+            for m in all_memories[:5]
+        ]
 
         return result
     except Exception as e:

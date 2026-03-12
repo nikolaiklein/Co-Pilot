@@ -543,8 +543,9 @@ class AIEngine:
         user_name: str = None,
         provider_name: str = None,
         model: str = None,
+        memory_context: str = None,
     ) -> str:
-        """Генерирует ответ ИИ с учётом истории и профиля пользователя."""
+        """Генерирует ответ ИИ с учётом истории, профиля и контекста памяти."""
         try:
             provider = self.get_provider(provider_name, model)
         except ValueError as e:
@@ -553,6 +554,9 @@ class AIEngine:
 
         try:
             system_prompt = build_system_prompt(user_profile, user_name)
+            # Контекст памяти добавляется в system prompt, а не в user message
+            if memory_context:
+                system_prompt += f"\n\n{memory_context}"
             messages = list(history) + [{"role": "user", "content": user_text}]
             response = await provider.generate(messages, system_prompt)
             if response:

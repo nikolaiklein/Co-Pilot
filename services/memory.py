@@ -1,68 +1,116 @@
 """
-Сервис долговременной памяти на базе Gemini Embedding + Firestore Vector Search.
+Сервис долговременной памяти на базе Mem0.
 
 Архитектура:
-- Каждое сообщение пользователя получает эмбеддинг через Gemini Embedding API
-- Эмбеддинг сохраняется в Firestore вместе с текстом
-- При необходимости (триггерные слова или явный запрос) — vector search по всей истории
-- Найденные релевантные фрагменты добавляются в контекст LLM
+- Mem0 автоматически извлекает факты из сообщений через LLM
+- Каждый факт получает эмбеддинг и сохраняется в Qdrant
+- Дедупликация: повторные факты обновляются, а не дублируются
+- Поиск: vector search + LLM-ранжирование
+- Не нужны триггерные слова — всегда ищем релевантный контекст
 
-Firestore structure:
-  users/{user_id}/memory/{auto_id}
-    ├── content: string          — текст сообщения
-    ├── role: "user" | "assistant"
-    ├── embedding: Vector(3072)  — Gemini embedding
-    ├── timestamp: timestamp
-    └── summary_block: bool      — True если это суммаризация блока
+Требования:
+- pip install mem0ai
+- GEMINI_API_KEY — для LLM и эмбеддингов
+- QDRANT_URL + QDRANT_API_KEY — для vector store (или локальный путь для dev)
 """
 
 import os
-import re
 import asyncio
 import logging
-from google.cloud import firestore
-from google.cloud.firestore_v1.vector import Vector
-from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 
 logger = logging.getLogger(__name__)
 
-# Триггерные слова для автоматического поиска в памяти
-MEMORY_TRIGGERS = re.compile(
-    r'(?:вспомни|помнишь|мы обсуждали|я говорил|я рассказывал|'
-    r'ранее|раньше|прошлый раз|в прошлом|напомни|'
-    r'как я говорил|мы договорились|я упоминал|'
-    r'найди|поищи|поиск|искать|потяни|вытащи|покажи|'
-    r'что я загружал|что я отправлял|что было|'
-    r'информаци[юия]|данные о|данные по|данные про|'
-    r'что (?:ты )?знаешь о|что (?:ты )?знаешь про|'
-    r'в моих (?:записях|данных|файлах|сообщениях)|'
-    r'из (?:памяти|загруженного|моих данных)|'
-    r'remember|recall|we discussed|i told you|i said|earlier|last time|'
-    r'find|search|look up)',
-    re.IGNORECASE
-)
+# Флаг: удалось ли импортировать mem0
+_MEM0_AVAILABLE = False
+try:
+    from mem0 import AsyncMemory
+    _MEM0_AVAILABLE = True
+except ImportError:
+    logger.warning("mem0ai не установлен. Установите: pip install mem0ai")
 
 
 class MemoryService:
-    """Сервис долговременной памяти с vector search."""
+    """Сервис долговременной памяти с Mem0 + Qdrant."""
 
-    def __init__(self, db: firestore.AsyncClient, gemini_api_key: str):
-        self.db = db
-        self.api_key = gemini_api_key
-        self._http_session = None
-        # Семафор: макс 5 параллельных вызовов к Embedding API
-        self._embedding_semaphore = asyncio.Semaphore(5)
-        # Очередь для фоновых задач (store_message)
+    def __init__(self, gemini_api_key: str, qdrant_url: str = None, qdrant_api_key: str = None):
+        if not _MEM0_AVAILABLE:
+            raise ImportError("mem0ai не установлен. pip install mem0ai")
+
+        self._config = self._build_config(gemini_api_key, qdrant_url, qdrant_api_key)
+        self._memory = None  # lazy init — AsyncMemory.from_config() is a coroutine
+
+        # Очередь для фоновых задач (store)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task = None
-        logger.info("MemoryService инициализирован.")
 
-    async def _get_session(self):
-        """Lazy-init aiohttp session."""
-        if self._http_session is None or self._http_session.closed:
-            import aiohttp
-            self._http_session = aiohttp.ClientSession()
-        return self._http_session
+        logger.info("MemoryService (Mem0) инициализирован (lazy).")
+
+    @property
+    def memory(self):
+        """Доступ к внутреннему объекту memory (для миграции и тестов)."""
+        return self._memory
+
+    async def _ensure_memory(self) -> "AsyncMemory":
+        """Lazy-инициализация AsyncMemory (корутина)."""
+        if self._memory is None:
+            self._memory = await AsyncMemory.from_config(self._config)
+            logger.info("AsyncMemory инициализирован.")
+        return self._memory
+
+    @staticmethod
+    def _build_config(gemini_api_key: str, qdrant_url: str = None, qdrant_api_key: str = None) -> dict:
+        """Собирает конфигурацию Mem0."""
+        config = {
+            "version": "v1.1",
+            "llm": {
+                "provider": "gemini",
+                "config": {
+                    "model": "gemini-2.0-flash",
+                    "api_key": gemini_api_key,
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                }
+            },
+            "embedder": {
+                "provider": "gemini",
+                "config": {
+                    "model": "models/gemini-embedding-001",
+                    "embedding_dims": 768,
+                    "api_key": gemini_api_key,
+                }
+            },
+            "history_db_path": "/tmp/mem0_history.db",
+        }
+
+        # Отключаем телеметрию
+        os.environ.setdefault("MEM0_TELEMETRY", "false")
+
+        if qdrant_url:
+            # Удалённый Qdrant (Cloud или self-hosted)
+            vs_config = {
+                "url": qdrant_url,
+                "collection_name": "copilot_memory",
+                "embedding_model_dims": 768,
+            }
+            if qdrant_api_key:
+                vs_config["api_key"] = qdrant_api_key
+            config["vector_store"] = {"provider": "qdrant", "config": vs_config}
+        else:
+            # Локальный Qdrant (для разработки)
+            config["vector_store"] = {
+                "provider": "qdrant",
+                "config": {
+                    "path": "/tmp/qdrant_mem0",
+                    "collection_name": "copilot_memory",
+                    "embedding_model_dims": 768,
+                }
+            }
+            logger.warning("QDRANT_URL не задан — используется локальный Qdrant (/tmp/qdrant_mem0). "
+                           "Данные НЕ сохраняются при рестарте Cloud Run!")
+
+        return config
+
+    # --- Очередь для фоновой записи ---
 
     async def _start_worker(self):
         """Запускает воркер очереди если ещё не запущен."""
@@ -70,11 +118,12 @@ class MemoryService:
             self._worker_task = asyncio.create_task(self._queue_worker())
 
     async def _queue_worker(self):
-        """Воркер: обрабатывает очередь store_message по одному, с семафором."""
+        """Воркер: обрабатывает очередь по одному."""
         while True:
             try:
-                user_id, role, content = await asyncio.wait_for(self._queue.get(), timeout=300)
-                await self._do_store_message(user_id, role, content)
+                task = await asyncio.wait_for(self._queue.get(), timeout=300)
+                user_id, messages, infer = task
+                await self._do_store(user_id, messages, infer)
                 self._queue.task_done()
             except asyncio.TimeoutError:
                 logger.info("Memory queue worker: idle 5 min, shutting down")
@@ -82,241 +131,130 @@ class MemoryService:
             except Exception as e:
                 logger.error(f"Memory queue worker error: {e}")
 
-    async def enqueue_store(self, user_id: int, role: str, content: str):
-        """Ставит сообщение в очередь для фонового сохранения с эмбеддингом."""
-        await self._queue.put((user_id, role, content))
+    async def _do_store(self, user_id: int, messages: list[dict], infer: bool):
+        """Внутренняя реализация сохранения через Mem0."""
+        try:
+            memory = await self._ensure_memory()
+            result = await memory.add(
+                messages,
+                user_id=str(user_id),
+                infer=infer,
+            )
+            events = result.get("results", [])
+            added = sum(1 for e in events if e.get("event") == "ADD")
+            updated = sum(1 for e in events if e.get("event") == "UPDATE")
+            logger.info(f"✅ Mem0 store for user {user_id}: +{added} new, ~{updated} updated (infer={infer})")
+        except Exception as e:
+            logger.error(f"Ошибка Mem0 add для {user_id}: {e}")
+
+    # --- Публичный API ---
+
+    async def store_message(self, user_id: int, role: str, content: str, infer: bool = True):
+        """
+        Ставит сообщение в очередь для фонового сохранения.
+        Mem0 автоматически извлекает факты (infer=True) или сохраняет как есть (infer=False).
+        """
+        messages = [{"role": role, "content": content}]
+        await self._queue.put((user_id, messages, infer))
         await self._start_worker()
         logger.info(f"Memory queued for user {user_id} (role={role}, queue_size={self._queue.qsize()})")
 
-    async def close(self):
-        """Закрыть HTTP-сессию и остановить воркер."""
-        if self._worker_task and not self._worker_task.done():
-            # Дождёмся обработки оставшихся задач (макс 30 сек)
-            try:
-                await asyncio.wait_for(self._queue.join(), timeout=30)
-            except asyncio.TimeoutError:
-                logger.warning("Memory queue not drained in 30s, stopping worker")
-            self._worker_task.cancel()
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
-
-    async def get_embedding(self, text: str) -> list[float] | None:
-        """Получить эмбеддинг текста через Gemini Embedding API (768 dimensions)."""
-        try:
-            async with self._embedding_semaphore:
-                return await self._get_embedding_impl(text)
-        except Exception as e:
-            logger.error(f"Ошибка получения эмбеддинга: {e}")
-            return None
-
-    async def _get_embedding_impl(self, text: str) -> list[float] | None:
-        """Внутренняя реализация получения эмбеддинга."""
-        try:
-            session = await self._get_session()
-            url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-            # Обрезаем текст до 2000 символов (лимит API)
-            truncated = text[:2000]
-            payload = {
-                "model": "models/gemini-embedding-001",
-                "content": {"parts": [{"text": truncated}]},
-                "outputDimensionality": 768,  # Firestore max 2048, 768 оптимально
-            }
-            async with session.post(
-                url,
-                json=payload,
-                headers={
-                    "x-goog-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                },
-                timeout=__import__('aiohttp').ClientTimeout(total=10),
-            ) as resp:
-                data = await resp.json()
-                values = data.get("embedding", {}).get("values")
-                if values and len(values) > 0:
-                    return values
-                logger.warning(f"Пустой эмбеддинг: {data.get('error', 'unknown')}")
-                return None
-        except Exception as e:
-            logger.error(f"Ошибка получения эмбеддинга: {e}")
-            return None
-
-    async def store_message(self, user_id: int, role: str, content: str):
+    async def store_conversation(self, user_id: int, user_text: str, assistant_text: str):
         """
-        Ставит сообщение в очередь для фонового сохранения.
-        Не блокирует вызывающий код — возвращается сразу.
+        Сохраняет пару user+assistant для лучшего извлечения фактов.
+        Mem0 видит контекст целиком и извлекает факты точнее.
         """
-        await self.enqueue_store(user_id, role, content)
-
-    async def _do_store_message(self, user_id: int, role: str, content: str):
-        """
-        Сохранить сообщение с эмбеддингом в коллекцию memory.
-        Вызывается воркером очереди.
-        """
-        try:
-            embedding = await self.get_embedding(content)
-            if not embedding:
-                logger.warning(f"Не удалось получить эмбеддинг, сохраняем без вектора")
-                memory_ref = self.db.collection('users').document(str(user_id)).collection('memory')
-                await memory_ref.add({
-                    'content': content,
-                    'role': role,
-                    'timestamp': firestore.SERVER_TIMESTAMP,
-                    'summary_block': False,
-                })
-                return
-
-            memory_ref = self.db.collection('users').document(str(user_id)).collection('memory')
-            await memory_ref.add({
-                'content': content,
-                'role': role,
-                'embedding': Vector(embedding),
-                'timestamp': firestore.SERVER_TIMESTAMP,
-                'summary_block': False,
-            })
-            logger.info(f"✅ Memory stored for user {user_id} (role={role}, len={len(content)}, embedding_dims={len(embedding)})")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения в memory для {user_id}: {e}")
+        messages = [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": assistant_text},
+        ]
+        await self._queue.put((user_id, messages, True))
+        await self._start_worker()
+        logger.info(f"Memory conversation queued for user {user_id} (queue_size={self._queue.qsize()})")
 
     async def search_memory(self, user_id: int, query: str, limit: int = 5) -> list[dict]:
         """
-        Семантический поиск по всей истории пользователя.
+        Семантический поиск по памяти пользователя.
 
         Returns:
-            list[dict]: Список найденных сообщений [{role, content, distance}]
+            list[dict]: [{id, content, score, role}]
         """
         try:
-            query_embedding = await self.get_embedding(query)
-            if not query_embedding:
-                return []
-
-            memory_ref = self.db.collection('users').document(str(user_id)).collection('memory')
-
-            # Firestore Vector Search
-            vector_query = memory_ref.find_nearest(
-                vector_field="embedding",
-                query_vector=Vector(query_embedding),
-                distance_measure=DistanceMeasure.COSINE,
+            memory = await self._ensure_memory()
+            result = await memory.search(
+                query,
+                user_id=str(user_id),
                 limit=limit,
             )
-
-            docs = await vector_query.get()
-
-            results = []
-            for doc in docs:
-                data = doc.to_dict()
-                results.append({
-                    'role': data.get('role', 'user'),
-                    'content': data.get('content', ''),
-                    'summary_block': data.get('summary_block', False),
-                })
-
-            logger.info(f"Memory search for user {user_id}: found {len(results)} results")
-            return results
+            memories = result.get("results", [])
+            return [
+                {
+                    "id": m.get("id", ""),
+                    "content": m.get("memory", ""),
+                    "score": m.get("score", 0),
+                    "role": "memory",
+                }
+                for m in memories
+            ]
         except Exception as e:
-            logger.error(f"Ошибка поиска в memory для {user_id}: {e}")
+            logger.error(f"Ошибка поиска Mem0 для {user_id}: {e}")
             return []
-
-    def should_search_memory(self, text: str) -> bool:
-        """Проверяет, содержит ли текст триггерные слова для поиска в памяти."""
-        return bool(MEMORY_TRIGGERS.search(text))
 
     async def get_memory_context(self, user_id: int, user_text: str) -> str:
         """
-        Основной метод: определяет нужен ли поиск и возвращает контекст.
-
-        Returns:
-            str: Форматированный контекст из памяти (или пустая строка).
+        Всегда ищет релевантные воспоминания и возвращает контекст.
+        Не нужны триггерные слова — Mem0 хранит факты, а не сырой текст,
+        поэтому поиск точнее и не даёт мусора.
         """
-        trigger_match = self.should_search_memory(user_text)
-        if not trigger_match:
-            logger.info(f"Memory: no trigger words in message from user {user_id}")
-            return ""
-
-        logger.info(f"Memory: trigger detected for user {user_id}, searching...")
         results = await self.search_memory(user_id, user_text, limit=5)
         if not results:
             return ""
 
-        # Форматируем найденные фрагменты
-        lines = ["[КОНТЕКСТ ИЗ ДОЛГОВРЕМЕННОЙ ПАМЯТИ — релевантные фрагменты прошлых разговоров:]"]
-        for i, r in enumerate(results, 1):
-            role_label = "Пользователь" if r['role'] == 'user' else "Ассистент"
-            prefix = "[Конспект]" if r.get('summary_block') else ""
-            lines.append(f"  {i}. {prefix}{role_label}: {r['content'][:500]}")
+        # Фильтруем по релевантности (score 0-1, выше = лучше)
+        relevant = [r for r in results if r.get('score', 0) >= 0.3]
+        if not relevant:
+            logger.debug(f"Memory: results found but below threshold for user {user_id}")
+            return ""
+
+        lines = ["[КОНТЕКСТ ИЗ ДОЛГОВРЕМЕННОЙ ПАМЯТИ — извлечённые факты о пользователе:]"]
+        for i, r in enumerate(relevant, 1):
+            lines.append(f"  {i}. {r['content'][:500]}")
         lines.append("[КОНЕЦ КОНТЕКСТА ПАМЯТИ]\n")
 
         context = "\n".join(lines)
-        logger.info(f"Memory context for user {user_id}: {len(results)} fragments, {len(context)} chars")
+        logger.info(f"Memory context for user {user_id}: {len(relevant)} facts, {len(context)} chars")
         return context
+
+    async def get_all_memories(self, user_id: int, limit: int = 100) -> list[dict]:
+        """Получить все воспоминания пользователя."""
+        try:
+            result = await self.memory.get_all(user_id=str(user_id), limit=limit)
+            return result.get("results", [])
+        except Exception as e:
+            logger.error(f"Ошибка get_all для {user_id}: {e}")
+            return []
+
+    async def delete_all(self, user_id: int):
+        """Удалить все воспоминания пользователя."""
+        try:
+            await self.memory.delete_all(user_id=str(user_id))
+            logger.info(f"Все воспоминания удалены для user {user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка delete_all для {user_id}: {e}")
 
     async def summarize_old_messages(self, user_id: int, ai_engine, batch_size: int = 30):
         """
-        Суммаризирует старые сообщения в блоки-конспекты.
-        Вызывается периодически (cron) для сжатия истории.
-
-        Args:
-            user_id: Telegram User ID
-            ai_engine: AIEngine для суммаризации
-            batch_size: сколько сообщений объединять в один конспект
+        С Mem0 суммаризация не нужна — дедупликация происходит автоматически.
+        Метод оставлен для совместимости с cron endpoint.
         """
-        try:
-            memory_ref = self.db.collection('users').document(str(user_id)).collection('memory')
+        logger.info(f"summarize_old_messages: с Mem0 не требуется (user {user_id})")
 
-            # Берём старые сообщения (не конспекты), сортируем по времени
-            query = (
-                memory_ref
-                .where('summary_block', '==', False)
-                .order_by('timestamp')
-                .limit(batch_size)
-            )
-            docs = await query.get()
-
-            if len(docs) < batch_size:
-                return  # Недостаточно сообщений для суммаризации
-
-            # Формируем текст для суммаризации
-            messages_text = []
-            doc_refs = []
-            for doc in docs:
-                data = doc.to_dict()
-                role = "Пользователь" if data['role'] == 'user' else "Ассистент"
-                messages_text.append(f"{role}: {data['content']}")
-                doc_refs.append(doc.reference)
-
-            dialog_text = "\n".join(messages_text)
-
-            # Суммаризируем через LLM
-            summary_prompt = f"""Сожми следующий диалог в краткий конспект (3-5 предложений).
-Сохрани ключевые факты, решения, имена, даты и важные детали.
-Пиши от третьего лица.
-
-Диалог:
-{dialog_text}
-
-Конспект:"""
-
-            summary = await ai_engine.analyze_content(summary_prompt)
-            if not summary or len(summary) < 10:
-                return
-
-            # Сохраняем конспект с эмбеддингом
-            embedding = await self.get_embedding(summary)
-            summary_data = {
-                'content': summary,
-                'role': 'system',
-                'timestamp': firestore.SERVER_TIMESTAMP,
-                'summary_block': True,
-            }
-            if embedding:
-                summary_data['embedding'] = Vector(embedding)
-
-            await memory_ref.add(summary_data)
-
-            # Удаляем оригинальные сообщения (они заменены конспектом)
-            for ref in doc_refs:
-                await ref.delete()
-
-            logger.info(f"Summarized {len(doc_refs)} messages for user {user_id}")
-
-        except Exception as e:
-            logger.error(f"Ошибка суммаризации для {user_id}: {e}")
+    async def close(self):
+        """Дождаться обработки очереди и завершить."""
+        if self._worker_task and not self._worker_task.done():
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("Memory queue not drained in 30s")
+            self._worker_task.cancel()
+        logger.info("MemoryService closed.")

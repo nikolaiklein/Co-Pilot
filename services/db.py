@@ -226,6 +226,56 @@ class DatabaseService:
             logger.error(f"Ошибка при очистке сообщений для {user_id}: {e}")
             return 0
 
+    async def get_allowed_users(self) -> set[int] | None:
+        """
+        Загружает список разрешённых пользователей из Firestore.
+
+        Returns:
+            set[int] | None: Множество user_id или None, если документ не найден.
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            doc_ref = self.db.collection('settings').document('allowed_users')
+            doc = await doc_ref.get()
+
+            if doc.exists:
+                data = doc.to_dict()
+                uids = data.get('user_ids', [])
+                result = {int(uid) for uid in uids}
+                logger.info(f"Загружено {len(result)} разрешённых пользователей из Firestore.")
+                return result
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке allowed_users из Firestore: {e}")
+            return None
+
+    async def save_allowed_users(self, user_ids: set[int]) -> bool:
+        """
+        Сохраняет список разрешённых пользователей в Firestore.
+
+        Args:
+            user_ids: Множество разрешённых Telegram user_id.
+
+        Returns:
+            bool: True если успешно сохранено.
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован. Вызовите initialize().")
+
+        try:
+            doc_ref = self.db.collection('settings').document('allowed_users')
+            await doc_ref.set({
+                'user_ids': sorted(list(user_ids)),
+                'updated_at': firestore.SERVER_TIMESTAMP
+            })
+            logger.info(f"Сохранено {len(user_ids)} разрешённых пользователей в Firestore.")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении allowed_users в Firestore: {e}")
+            return False
+
     async def get_all_user_ids(self) -> list:
         """
         Получает список всех ID пользователей из БД.

@@ -105,13 +105,22 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         logger.warning("TELEGRAM_BOT_TOKEN не найден в переменных окружения.")
         return None
 
-    # Список разрешённых пользователей (пустой = все разрешены)
-    allowed_users_str = os.getenv("ALLOWED_USERS", "")
+    # Список разрешённых пользователей (Firestore → fallback на env var)
     allowed_users = set()
-    if allowed_users_str.strip():
-        allowed_users = {int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()}
-    if allowed_users:
-        logger.info(f"Авторизация включена. Разрешённые пользователи: {allowed_users}")
+    firestore_users = await db_service.get_allowed_users() if db_service else None
+    if firestore_users is not None:
+        allowed_users = firestore_users
+        logger.info(f"Авторизация загружена из Firestore. Разрешённые пользователи: {allowed_users}")
+    else:
+        allowed_users_str = os.getenv("ALLOWED_USERS", "")
+        if allowed_users_str.strip():
+            allowed_users = {int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()}
+            # Первичная миграция: сохраняем env var в Firestore
+            if db_service and allowed_users:
+                await db_service.save_allowed_users(allowed_users)
+                logger.info(f"Мигрировали ALLOWED_USERS из env в Firestore: {allowed_users}")
+        if allowed_users:
+            logger.info(f"Авторизация из env. Разрешённые пользователи: {allowed_users}")
 
     try:
         # Создаем билдер приложения
@@ -188,29 +197,24 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     except Exception as mem_err:
                         logger.warning(f"Memory search error: {mem_err}")
 
-                # 6. Генерируем ответ (с контекстом памяти)
-                augmented_text = user_text
-                if memory_context:
-                    augmented_text = f"{memory_context}\n{user_text}"
-
+                # 6. Генерируем ответ (контекст памяти идёт в system prompt)
                 response_text = await ai_engine.generate_response(
                     user_id=user.id,
-                    user_text=augmented_text,
+                    user_text=user_text,
                     history=history_for_ai,
                     user_profile=db_user,
                     user_name=user.first_name,
                     provider_name=user_provider,
                     model=user_model,
+                    memory_context=memory_context if memory_context else None,
                 )
 
                 # 6. Сохраняем ответ ассистента
                 await db_service.save_message(user.id, "assistant", response_text)
 
-                # 6.1 Сохраняем в долговременную память (фоново)
+                # 6.1 Сохраняем в долговременную память (фоново, Mem0 извлекает факты)
                 if memory_service:
-                    import asyncio
-                    await memory_service.store_message(user.id, "user", user_text)
-                    await memory_service.store_message(user.id, "assistant", response_text)
+                    await memory_service.store_conversation(user.id, user_text, response_text)
 
                 # 6.2 Запускаем анализ профиля после каждых 3 сообщений пользователя
                 if analyzer_service:
@@ -692,40 +696,34 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
                 text = f"🔍 <b>Результаты поиска:</b> «{query}»\n\n"
                 for i, r in enumerate(results, 1):
-                    role_label = "👤" if r['role'] == 'user' else "🤖"
-                    prefix = "[📋 Конспект] " if r.get('summary_block') else ""
+                    score = r.get('score', 0)
                     content_preview = r['content'][:200]
-                    text += f"{i}. {role_label} {prefix}{content_preview}\n\n"
+                    text += f"{i}. 🧠 (score: {score:.2f}) {content_preview}\n\n"
 
                 await update.message.reply_text(text, parse_mode=ParseMode.HTML)
             else:
-                # Статистика памяти
+                # Статистика памяти (через Mem0 API)
                 try:
-                    from google.cloud import firestore as fs
-                    memory_ref = memory_service.db.collection('users').document(str(user.id)).collection('memory')
+                    all_memories = await memory_service.get_all_memories(user.id, limit=500)
+                    total = len(all_memories)
 
-                    # Считаем документы
-                    all_docs = await memory_ref.limit(500).get()
-                    total = len(all_docs)
-
-                    user_msgs = sum(1 for d in all_docs if d.to_dict().get('role') == 'user')
-                    assistant_msgs = sum(1 for d in all_docs if d.to_dict().get('role') == 'assistant')
-                    summaries = sum(1 for d in all_docs if d.to_dict().get('summary_block'))
-                    with_embedding = sum(1 for d in all_docs if d.to_dict().get('embedding'))
-
-                    text = f"""🧠 <b>Долговременная память</b>
+                    text = f"""🧠 <b>Долговременная память (Mem0)</b>
 
 📊 <b>Статистика:</b>
-  Всего записей: {total}
-  👤 Пользователь: {user_msgs}
-  🤖 Ассистент: {assistant_msgs}
-  📋 Конспектов: {summaries}
-  🔢 С эмбеддингом: {with_embedding}
+  Извлечённых фактов: {total}
 
 💡 <b>Команды:</b>
   <code>/memory search запрос</code> — поиск по памяти
 
-ℹ️ Память автоматически сохраняет все сообщения и ищет релевантный контекст при триггерных словах (вспомни, помнишь, мы обсуждали...)"""
+ℹ️ Mem0 автоматически извлекает факты из каждого разговора, дедуплицирует и обновляет существующие.
+Поиск по памяти происходит при каждом сообщении — триггерные слова не нужны."""
+
+                    # Показать последние 5 фактов
+                    if all_memories:
+                        text += "\n\n📝 <b>Последние факты:</b>\n"
+                        for m in all_memories[:5]:
+                            memory_text = m.get("memory", "")[:150]
+                            text += f"  • {memory_text}\n"
 
                     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -776,6 +774,114 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 )
 
         application.add_handler(CommandHandler("bulk", handle_bulk))
+
+        # --- Админ-команды ---
+        OWNER_ID = 292628110
+
+        async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Админ-команды для управления ботом.
+            Доступно только владельцу (OWNER_ID).
+
+            Использование:
+              /admin add <user_id>     — добавить пользователя
+              /admin remove <user_id>  — удалить пользователя
+              /admin list              — список разрешённых
+              /admin stats             — статистика
+            """
+            user = update.effective_user
+            if user.id != OWNER_ID:
+                return  # Молча игнорируем
+
+            args = context.args if context.args else []
+
+            if not args:
+                help_text = (
+                    "🔧 <b>Админ-панель</b>\n\n"
+                    "Команды:\n"
+                    "<code>/admin add {user_id}</code> — добавить пользователя\n"
+                    "<code>/admin remove {user_id}</code> — удалить пользователя\n"
+                    "<code>/admin list</code> — список разрешённых\n"
+                    "<code>/admin stats</code> — статистика\n"
+                )
+                await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+                return
+
+            action = args[0].lower()
+
+            if action == "add" and len(args) >= 2:
+                try:
+                    new_uid = int(args[1])
+                    allowed_users.add(new_uid)
+                    # Персистим в Firestore
+                    saved = await db_service.save_allowed_users(allowed_users)
+                    persist_status = "💾 Сохранено в Firestore." if saved else "⚠️ Не удалось сохранить в Firestore!"
+                    logger.info(f"Админ добавил пользователя {new_uid}. Текущий список: {allowed_users}")
+                    await update.message.reply_text(
+                        f"✅ Пользователь <code>{new_uid}</code> добавлен.\n"
+                        f"Всего разрешённых: {len(allowed_users)}\n"
+                        f"{persist_status}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except ValueError:
+                    await update.message.reply_text("❌ Неверный ID. Укажите числовой Telegram user_id.")
+
+            elif action == "remove" and len(args) >= 2:
+                try:
+                    rm_uid = int(args[1])
+                    if rm_uid == OWNER_ID:
+                        await update.message.reply_text("❌ Нельзя удалить владельца.")
+                        return
+                    allowed_users.discard(rm_uid)
+                    # Персистим в Firestore
+                    saved = await db_service.save_allowed_users(allowed_users)
+                    persist_status = "💾 Сохранено в Firestore." if saved else "⚠️ Не удалось сохранить в Firestore!"
+                    logger.info(f"Админ удалил пользователя {rm_uid}. Текущий список: {allowed_users}")
+                    await update.message.reply_text(
+                        f"✅ Пользователь <code>{rm_uid}</code> удалён.\n"
+                        f"Всего разрешённых: {len(allowed_users)}\n"
+                        f"{persist_status}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except ValueError:
+                    await update.message.reply_text("❌ Неверный ID. Укажите числовой Telegram user_id.")
+
+            elif action == "list":
+                if not allowed_users:
+                    await update.message.reply_text("🔓 Режим открытого доступа (ALLOWED_USERS пуст — все допущены).")
+                else:
+                    lines = []
+                    for uid in sorted(allowed_users):
+                        user_data = await db_service.get_user(uid)
+                        if user_data:
+                            name = user_data.get('first_name', '')
+                            username = user_data.get('username', '')
+                            label = f"{name} (@{username})" if username else name
+                            lines.append(f"• <code>{uid}</code> — {label}")
+                        else:
+                            lines.append(f"• <code>{uid}</code>")
+                    users_list = "\n".join(lines)
+                    await update.message.reply_text(
+                        f"👥 <b>Разрешённые пользователи ({len(allowed_users)}):</b>\n{users_list}",
+                        parse_mode=ParseMode.HTML
+                    )
+
+            elif action == "stats":
+                total_allowed = len(allowed_users) if allowed_users else "∞ (все)"
+                bulk_active = len(bulk_mode_users)
+                await update.message.reply_text(
+                    f"📊 <b>Статистика</b>\n\n"
+                    f"Разрешённых пользователей: {total_allowed}\n"
+                    f"В режиме bulk: {bulk_active}",
+                    parse_mode=ParseMode.HTML
+                )
+
+            else:
+                await update.message.reply_text(
+                    "❓ Неизвестная команда. Используйте /admin без аргументов для справки."
+                )
+
+        application.add_handler(CommandHandler("admin", handle_admin))
 
         async def extract_text_from_file(file_bytes: bytes, file_name: str) -> str | None:
             """Извлекает текст из файла по расширению."""

@@ -56,7 +56,9 @@ jobs:
           GEMINI_API_KEY=GEMINI_API_KEY:latest,\
           NVIDIA_API_KEY=NVIDIA_API_KEY:latest,\
           ALLOWED_USERS=ALLOWED_USERS:latest,\
-          DEFAULT_MODEL=DEFAULT_MODEL:latest"
+          DEFAULT_MODEL=DEFAULT_MODEL:latest,\
+          QDRANT_URL=QDRANT_URL:latest,\
+          QDRANT_API_KEY=QDRANT_API_KEY:latest"
 
       - name: Show deployed URL
         run: |
