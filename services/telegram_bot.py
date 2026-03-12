@@ -139,11 +139,11 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         # Общая функция для обработки логики диалога (используется для текста и голоса)
         async def process_dialog_turn(user, chat_id, user_text, context):
             try:
-                # 0. Режим bulk-загрузки: сохраняем в память без AI
+                # 0. Режим bulk-загрузки: сохраняем в память (сырой текст + факты)
                 if user.id in bulk_mode_users:
                     if memory_service:
                         import asyncio
-                        await memory_service.store_message(user.id, "user", user_text)
+                        await memory_service.store_bulk(user.id, user_text)
                         bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
                         count = bulk_mode_users[user.id]
                         # Отвечаем кратко каждые 5 сообщений, иначе тихо

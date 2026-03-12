@@ -159,6 +159,20 @@ class MemoryService:
         await self._start_worker()
         logger.info(f"Memory queued for user {user_id} (role={role}, queue_size={self._queue.qsize()})")
 
+    async def store_bulk(self, user_id: int, content: str):
+        """
+        Сохраняет данные для bulk-режима: и сырой текст, и извлечённые факты.
+        Сырой текст (infer=False) — чтобы поиск находил полный контент.
+        Факты (infer=True) — чтобы работала дедупликация и структурирование.
+        """
+        messages = [{"role": "user", "content": content}]
+        # Сначала сырой текст для полноты поиска
+        await self._queue.put((user_id, messages, False))
+        # Потом извлечение фактов
+        await self._queue.put((user_id, messages, True))
+        await self._start_worker()
+        logger.info(f"Memory bulk queued for user {user_id} (queue_size={self._queue.qsize()})")
+
     async def store_conversation(self, user_id: int, user_text: str, assistant_text: str):
         """
         Сохраняет пару user+assistant для лучшего извлечения фактов.
@@ -206,12 +220,12 @@ class MemoryService:
         Не нужны триггерные слова — Mem0 хранит факты, а не сырой текст,
         поэтому поиск точнее и не даёт мусора.
         """
-        results = await self.search_memory(user_id, user_text, limit=5)
+        results = await self.search_memory(user_id, user_text, limit=15)
         if not results:
             return ""
 
         # Фильтруем по релевантности (score 0-1, выше = лучше)
-        relevant = [r for r in results if r.get('score', 0) >= 0.3]
+        relevant = [r for r in results if r.get('score', 0) >= 0.2]
         if not relevant:
             logger.debug(f"Memory: results found but below threshold for user {user_id}")
             return ""
