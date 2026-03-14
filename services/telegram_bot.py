@@ -589,16 +589,124 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         # Регистрируем обработчик команды /correct
         application.add_handler(CommandHandler("correct", handle_correct))
 
+        async def _get_current_model(user_id: int) -> str:
+            """Возвращает текущую модель пользователя (litellm/model или provider/model)."""
+            user_data = await db_service.get_user(user_id)
+            return (user_data.get('selected_model') if user_data else None) or \
+                   f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
+
+        async def _build_categories_keyboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+            """Строит клавиатуру категорий моделей (первый экран /model)."""
+            from services.model_catalog import get_model_meta, MODEL_HINTS, FAMILY_ORDER
+
+            current = await _get_current_model(user_id)
+            catalog = getattr(ai_engine, '_model_catalog', None)
+
+            # Пытаемся получить каталог из app.state (ModelCatalog инициализирован в main.py)
+            if not catalog:
+                try:
+                    from main import app as fastapi_app
+                    catalog = getattr(fastapi_app.state, 'model_catalog', None)
+                except Exception:
+                    catalog = None
+
+            if not catalog or not catalog.is_available:
+                # Fallback: нет LiteLLM — показываем старые провайдеры текстом
+                from services.ai_engine import GEMINI_MODELS, NVIDIA_MODELS
+                lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n"]
+                lines.append("🔵 <b>Gemini:</b>")
+                for short_name in GEMINI_MODELS:
+                    lines.append(f"  <code>/model {short_name}</code>")
+                lines.append("\n🟢 <b>NVIDIA NIM:</b>")
+                for short_name in NVIDIA_MODELS:
+                    lines.append(f"  <code>/model {short_name}</code>")
+                return "\n".join(lines), None
+
+            groups = await catalog.get_models_grouped()
+            text = f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n\n🤖 <b>Выбери категорию:</b>"
+
+            buttons = []
+            for family in FAMILY_ORDER:
+                if family not in groups:
+                    continue
+                models = groups[family]
+                # Получаем emoji для семейства
+                meta = get_model_meta(models[0])
+                emoji = meta.get("emoji", "⬜")
+                count = len(models)
+                # Проверяем, есть ли текущая модель в этой категории
+                current_model = current.split("/", 1)[-1] if "/" in current else current
+                has_current = any(m == current_model for m in models)
+                check = " ✅" if has_current else ""
+                btn_text = f"{emoji} {family} ({count}){check}"
+                # callback data: mc:Family (mc = model category)
+                buttons.append([InlineKeyboardButton(btn_text, callback_data=f"mc:{family}")])
+
+            # Добавить оставшиеся группы не в FAMILY_ORDER
+            for family, models in groups.items():
+                if family in FAMILY_ORDER:
+                    continue
+                meta = get_model_meta(models[0])
+                emoji = meta.get("emoji", "⬜")
+                count = len(models)
+                buttons.append([InlineKeyboardButton(f"{emoji} {family} ({count})", callback_data=f"mc:{family}")])
+
+            return text, InlineKeyboardMarkup(buttons)
+
+        async def _build_models_keyboard(user_id: int, family: str) -> tuple[str, InlineKeyboardMarkup]:
+            """Строит клавиатуру моделей внутри категории (второй экран)."""
+            from services.model_catalog import get_model_meta, MODEL_HINTS
+
+            current = await _get_current_model(user_id)
+            current_model = current.split("/", 1)[-1] if "/" in current else current
+
+            catalog = None
+            try:
+                from main import app as fastapi_app
+                catalog = getattr(fastapi_app.state, 'model_catalog', None)
+            except Exception:
+                pass
+
+            if not catalog:
+                return "❌ Каталог моделей недоступен.", InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mback")]])
+
+            groups = await catalog.get_models_grouped()
+            models = groups.get(family, [])
+
+            if not models:
+                return f"❌ Категория {family} пуста.", InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mback")]])
+
+            meta = get_model_meta(models[0])
+            emoji = meta.get("emoji", "⬜")
+            text = f"{emoji} <b>{family}</b> — выбери модель:"
+
+            buttons = []
+            for model_id in models:
+                hint = MODEL_HINTS.get(model_id, "")
+                check = " ✅" if model_id == current_model else ""
+                label = f"{model_id}{check}"
+                if hint:
+                    label = f"{model_id} {hint}{check}"
+                # callback data: ms:model_id (ms = model select)
+                # Telegram limit: 64 bytes. model_id + prefix should fit
+                cb_data = f"ms:{model_id}"
+                if len(cb_data.encode('utf-8')) > 64:
+                    cb_data = f"ms:{model_id[:55]}"
+                buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+            buttons.append([InlineKeyboardButton("« Назад", callback_data="mback")])
+            return text, InlineKeyboardMarkup(buttons)
+
         async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """
             Обрабатывает команду /model — переключение AI-модели.
-            /model — показать текущую и доступные
-            /model kimi-k2 — переключить по короткому имени
-            /model gemini/gemini-2.5-pro — переключить на конкретную
+            /model — показать inline-клавиатуру с категориями
+            /model kimi-k2 — переключить по короткому имени (power-user shortcut)
+            /model litellm/claude-opus-4.6 — переключить на конкретную LiteLLM модель
             """
             from services.ai_engine import (
                 DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP,
-                NVIDIA_MODELS, GEMINI_MODELS, parse_model_string, create_provider,
+                NVIDIA_MODELS, GEMINI_MODELS, parse_model_string,
             )
             user = update.effective_user
             if not is_authorized(user.id):
@@ -607,59 +715,50 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             args = context.args
 
             if not args:
-                # Получаем персональную модель пользователя из БД
-                user_data = await db_service.get_user(user.id)
-                user_selected = user_data.get('selected_model') if user_data else None
-                current = user_selected or f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
-                suffix = "" if user_selected else " (по умолчанию)"
-
-                lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>{suffix}\n"]
-
-                # Gemini
-                lines.append("🔵 <b>Gemini:</b>")
-                for short_name, full_name in GEMINI_MODELS.items():
-                    marker = " ✅" if current.endswith(full_name) else ""
-                    lines.append(f"  <code>/model {short_name}</code>{marker}")
-
-                # NVIDIA NIM models
-                lines.append("\n🟢 <b>NVIDIA NIM:</b>")
-                for short_name, full_name in NVIDIA_MODELS.items():
-                    marker = " ✅" if ai_engine.default_model == full_name else ""
-                    lines.append(f"  <code>/model {short_name}</code> → {full_name}{marker}")
-
-                # Anthropic / OpenAI (если ключи есть)
-                if os.getenv("ANTHROPIC_API_KEY") and os.getenv("ANTHROPIC_API_KEY") != "placeholder":
-                    lines.append("\n🟣 <b>Anthropic:</b>")
-                    lines.append("  <code>/model anthropic</code>")
-                if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_KEY") != "placeholder":
-                    lines.append("\n⚪ <b>OpenAI:</b>")
-                    lines.append("  <code>/model openai</code>")
-
-                await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+                # Inline keyboard UI
+                text, keyboard = await _build_categories_keyboard(user.id)
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
                 return
 
+            # Power-user shortcut: /model model-name
             model_string = " ".join(args).strip()
+
+            # Сначала проверяем, есть ли модель в LiteLLM каталоге
+            catalog = None
+            try:
+                from main import app as fastapi_app
+                catalog = getattr(fastapi_app.state, 'model_catalog', None)
+            except Exception:
+                pass
+
+            if catalog and catalog.is_available:
+                models = await catalog.get_models()
+                if model_string in models:
+                    # Прямое совпадение с LiteLLM моделью
+                    await db_service.update_user(user.id, {"selected_model": f"litellm/{model_string}"})
+                    await update.message.reply_text(
+                        f"✅ Модель: <code>litellm/{model_string}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+
+            # Fallback: старый парсинг (gemini-3-flash, nvidia/kimi-k2 и т.д.)
             provider_name, model = parse_model_string(model_string)
 
-            # Проверяем, что провайдер существует
             all_providers = set(PROVIDER_MAP.keys()) | set(OPENAI_COMPATIBLE_PROVIDERS.keys())
             if provider_name not in all_providers:
                 await update.message.reply_text(
-                    f"❌ Неизвестный провайдер или модель: <code>{model_string}</code>\n\n"
-                    f"Используй /model чтобы увидеть список.",
+                    f"❌ Неизвестная модель: <code>{model_string}</code>\n\n"
+                    f"Используй /model для списка.",
                     parse_mode=ParseMode.HTML
                 )
                 return
 
             try:
-                # Пробуем создать провайдер (проверяем наличие ключа)
                 ai_engine.get_provider(provider_name, model)
-
-                # Сохраняем выбор пользователя в БД
                 await db_service.update_user(user.id, {"selected_model": f"{provider_name}/{model}"})
-
                 await update.message.reply_text(
-                    f"✅ Модель переключена на <code>{provider_name}/{model}</code>",
+                    f"✅ Модель: <code>{provider_name}/{model}</code>",
                     parse_mode=ParseMode.HTML
                 )
             except ValueError as e:
@@ -1110,6 +1209,57 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     "Я буду постепенно узнавать тебя из наших диалогов. Начинай! 🚀"
                 )
 
+            # --- Model selection callbacks ---
+            elif data.startswith("mc:") or data == "mback" or data.startswith("ms:"):
+                if not is_authorized(user.id):
+                    return
+
+                if data.startswith("mc:"):
+                    # Категория выбрана — показываем модели внутри
+                    family = data[3:]
+                    text, keyboard = await _build_models_keyboard(user.id, family)
+                elif data == "mback":
+                    # Назад к категориям
+                    text, keyboard = await _build_categories_keyboard(user.id)
+                else:
+                    # ms: — модель выбрана
+                    model_id = data[3:]
+                    # Проверяем, что модель ещё есть в каталоге
+                    catalog = None
+                    try:
+                        from main import app as fastapi_app
+                        catalog = getattr(fastapi_app.state, 'model_catalog', None)
+                    except Exception:
+                        pass
+                    if catalog and catalog.is_available:
+                        models = await catalog.get_models()
+                        if model_id not in models:
+                            text = f"⚠️ Модель <code>{model_id}</code> больше недоступна.\n\nВыбери другую:"
+                            keyboard = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                            ])
+                            try:
+                                await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                            except Exception:
+                                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                            return
+
+                    await db_service.update_user(user.id, {"selected_model": f"litellm/{model_id}"})
+                    logger.info(f"Пользователь {user.id} выбрал модель: litellm/{model_id}")
+                    from services.model_catalog import get_model_meta, MODEL_HINTS
+                    meta = get_model_meta(model_id)
+                    hint = MODEL_HINTS.get(model_id, "")
+                    hint_str = f" ({hint})" if hint else ""
+                    text = f"✅ Модель переключена:\n\n{meta.get('emoji', '')} <code>{model_id}</code>{hint_str}"
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                    ])
+
+                try:
+                    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                except Exception:
+                    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
         # Регистрируем обработчик callback query (inline кнопки)
         application.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -1164,11 +1314,21 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 user_data = await db_service.get_user(user.id)
                 user_profile = user_data if user_data else None
 
+                # Определяем провайдер пользователя для vision
+                from services.ai_engine import parse_model_string
+                user_provider = None
+                user_model = None
+                user_model_str = user_data.get('selected_model') if user_data else None
+                if user_model_str:
+                    user_provider, user_model = parse_model_string(user_model_str)
+
                 response_text = await ai_engine.analyze_image(
                     bytes(image_bytes),
                     user_message=caption,
                     user_profile=user_profile,
-                    user_name=user.first_name
+                    user_name=user.first_name,
+                    provider_name=user_provider,
+                    model=user_model,
                 )
 
                 formatted_response = markdown_to_telegram_html(response_text)
@@ -1192,6 +1352,23 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         # Регистрируем обработчик документов/файлов
         application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+        # Глобальный обработчик ошибок — ловит необработанные исключения в хендлерах
+        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            """Логирует ошибки и уведомляет пользователя."""
+            logger.error(f"Исключение при обработке апдейта: {context.error}", exc_info=context.error)
+
+            # Попытка уведомить пользователя
+            if isinstance(update, Update) and update.effective_chat:
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="⚠️ Произошла внутренняя ошибка. Попробуйте ещё раз или напишите /start."
+                    )
+                except Exception:
+                    logger.error("Не удалось отправить сообщение об ошибке пользователю.")
+
+        application.add_error_handler(error_handler)
 
         # Инициализируем приложение
         await application.initialize()

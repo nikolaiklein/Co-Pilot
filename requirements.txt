@@ -12,3 +12,4 @@ python-docx>=1.1.0
 pydantic==2.10.0
 python-dotenv==1.0.1
 mem0ai>=0.1.30
+python-json-logger>=3.0.0

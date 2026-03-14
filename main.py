@@ -1,5 +1,7 @@
 import os
 import logging
+import sys
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from telegram import Update
 from dotenv import load_dotenv
@@ -9,194 +11,221 @@ from services.telegram_bot import create_bot_app
 from services.ai_engine import AIEngine
 from services.analyzer import AnalyzerService
 from services.memory import MemoryService
+from services.model_catalog import ModelCatalog
 
-# Настройка базового логирования
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования — JSON для Cloud Run, обычный для локальной разработки
+def _setup_logging():
+    """Инициализирует логирование. JSON-формат если есть python-json-logger."""
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(log_level)
+
+    try:
+        from pythonjsonlogger.json import JsonFormatter
+        formatter = JsonFormatter(
+            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+            rename_fields={"asctime": "timestamp", "levelname": "severity"},
+        )
+        handler.setFormatter(formatter)
+    except ImportError:
+        # Fallback: обычные текстовые логи (для локальной разработки)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения из файла .env (если он существует)
-# Это полезно для локальной разработки.
 load_dotenv()
 
-# Инициализация FastAPI приложения
-# title и version помогают при генерации документации Swagger UI
-app = FastAPI(
-    title="Telegram Bot API",
-    description="Backend for Telegram Bot using FastAPI and Firebase",
-    version="1.0.0"
-)
 
-# Глобальные переменные для сервисов
-db_service = None
-bot_app = None
-ai_engine = None
-analyzer_service = None
-memory_service = None
-
-# Событие запуска приложения
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
-    Выполняется при старте приложения.
-    Здесь происходит инициализация внешних сервисов: Firebase, DB, AI, Bot.
+    Lifespan context manager — замена deprecated on_event("startup"/"shutdown").
+    Инициализирует сервисы при старте и корректно завершает при остановке.
     """
-    global db_service, bot_app, ai_engine, analyzer_service, memory_service
+    # === STARTUP ===
     logger.info("Запуск приложения...")
 
-    # 1. Инициализация Firebase Admin
+    # 1. Firebase Admin
     try:
         init_firebase()
     except Exception as e:
         logger.warning(f"Не удалось инициализировать Firebase (возможно, отсутствуют учетные данные): {e}")
 
-    # 2. Инициализация сервиса базы данных
+    # 2. Database Service
     try:
-        db_service = DatabaseService()
-        await db_service.initialize()
+        app.state.db = DatabaseService()
+        await app.state.db.initialize()
     except Exception as e:
         logger.error(f"Ошибка инициализации DatabaseService: {e}")
+        app.state.db = None
 
-    # 3. Инициализация AI Engine
+    # 3. AI Engine
     try:
-        ai_engine = AIEngine()
-        # Проверяем, удалось ли создать клиента (есть ли ключ)
-        if not ai_engine.client:
+        app.state.ai_engine = AIEngine()
+        if not app.state.ai_engine.client:
             logger.warning("AI Engine инициализирован без клиента (нет API ключа).")
     except Exception as e:
         logger.error(f"Ошибка инициализации AIEngine: {e}")
+        app.state.ai_engine = None
 
-    # 4. Инициализация Memory Service (Mem0 + Qdrant)
+    # 4. Memory Service (Mem0 + Qdrant)
     try:
         gemini_key = os.getenv("GEMINI_API_KEY")
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
         if gemini_key:
-            memory_service = MemoryService(gemini_key, qdrant_url, qdrant_api_key)
+            app.state.memory = MemoryService(gemini_key, qdrant_url, qdrant_api_key)
             logger.info("Memory Service (Mem0) инициализирован.")
         else:
+            app.state.memory = None
             logger.warning("Memory Service не инициализирован (нет GEMINI_API_KEY).")
     except Exception as e:
         logger.error(f"Ошибка инициализации Memory Service: {e}")
+        app.state.memory = None
 
-    # 6. Инициализация Analyzer Service
+    # 5. Analyzer Service
     try:
-        if db_service and ai_engine:
-            analyzer_service = AnalyzerService(db_service, ai_engine)
+        if app.state.db and app.state.ai_engine:
+            app.state.analyzer = AnalyzerService(app.state.db, app.state.ai_engine)
             logger.info("Analyzer Service инициализирован.")
         else:
+            app.state.analyzer = None
             logger.warning("Analyzer Service не инициализирован (отсутствуют зависимости).")
     except Exception as e:
         logger.error(f"Ошибка инициализации Analyzer Service: {e}")
+        app.state.analyzer = None
 
-    # 7. Инициализация Telegram Bot Application
+    # 5.5. Model Catalog (LiteLLM)
     try:
-        bot_app = await create_bot_app(db_service, ai_engine, analyzer_service, memory_service)
-        if bot_app:
-             await bot_app.start()
-             logger.info("Telegram Bot запущен.")
+        app.state.model_catalog = ModelCatalog()
+        available, count = await app.state.model_catalog.check_health()
+        app.state.litellm_available = available
+        if available:
+            logger.info(f"LiteLLM доступен: {count} моделей")
         else:
-             logger.warning("Bot Application не создано (возможно, нет токена).")
+            litellm_url = os.getenv("LITELLM_BASE_URL", "")
+            if litellm_url:
+                logger.warning(f"LiteLLM недоступен ({litellm_url})")
+            else:
+                logger.info("LiteLLM не настроен (LITELLM_BASE_URL пуст)")
+    except Exception as e:
+        logger.warning(f"Ошибка инициализации Model Catalog: {e}")
+        app.state.model_catalog = ModelCatalog()
+        app.state.litellm_available = False
+
+    # 6. Telegram Bot Application
+    try:
+        app.state.bot_app = await create_bot_app(
+            app.state.db, app.state.ai_engine, app.state.analyzer, app.state.memory
+        )
+        if app.state.bot_app:
+            await app.state.bot_app.start()
+            logger.info("Telegram Bot запущен.")
+        else:
+            logger.warning("Bot Application не создано (возможно, нет токена).")
     except Exception as e:
         logger.error(f"Ошибка инициализации бота: {e}")
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    Выполняется при остановке приложения.
-    Корректное завершение работы бота.
-    """
-    global bot_app, memory_service
-    if memory_service:
-        await memory_service.close()
-    if bot_app:
+        app.state.bot_app = None
+
+    yield  # --- приложение работает ---
+
+    # === SHUTDOWN ===
+    if getattr(app.state, "memory", None):
+        await app.state.memory.close()
+    if getattr(app.state, "bot_app", None):
         logger.info("Остановка Telegram Bot...")
-        await bot_app.stop()
-        await bot_app.shutdown()
+        await app.state.bot_app.stop()
+        await app.state.bot_app.shutdown()
+
+
+# Инициализация FastAPI с lifespan
+app = FastAPI(
+    title="Telegram Bot API",
+    description="Backend for Telegram Bot using FastAPI and Firebase",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
 
 @app.get("/")
-async def health_check():
+async def health_check(request: Request):
     """
     Простой эндпоинт для проверки работоспособности сервиса.
     Cloud Run использует этот эндпоинт, чтобы понять, готов ли контейнер принимать трафик.
-
-    Returns:
-        dict: Статус приложения.
     """
-    return {"status": "alive"}
+    result = {"status": "alive"}
+    catalog = getattr(request.app.state, "model_catalog", None)
+    if catalog:
+        result["litellm"] = getattr(request.app.state, "litellm_available", False)
+        result["litellm_models"] = len(catalog._cache)
+    return result
+
 
 @app.post("/webhook")
 @app.post("/webhook/")
 async def telegram_webhook(request: Request):
     """
     Эндпоинт для получения обновлений от Telegram (Webhook).
-
-    Args:
-        request (Request): Входящий HTTP-запрос.
-
-    Returns:
-        dict: Статус обработки ('ok').
     """
+    bot_app = request.app.state.bot_app
     if not bot_app:
         logger.error("Bot Application не инициализировано. Игнорируем апдейт.")
         return {"status": "error", "message": "Bot not initialized"}
 
     try:
-        # Получаем JSON из запроса
         data = await request.json()
-
-        # Преобразуем JSON в объект Update библиотеки python-telegram-bot
         update = Update.de_json(data, bot_app.bot)
-
-        # Обрабатываем обновление асинхронно
         await bot_app.process_update(update)
-
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Ошибка при обработке вебхука: {e}")
-        # Возвращаем 200 OK даже при ошибке, чтобы Telegram не слал повторные запросы бесконечно
         return {"status": "error", "message": str(e)}
 
+
 @app.post("/cron/analyze")
-async def analyze_user_cron(user_id: int):
+async def analyze_user_cron(request: Request, user_id: int):
     """
     Эндпоинт для запуска анализа профиля пользователя по расписанию.
-    Cloud Scheduler должен делать POST запрос сюда с параметром user_id.
-
-    Args:
-        user_id (int): ID пользователя для анализа.
-
-    Returns:
-        dict: Результат анализа.
     """
-    if not analyzer_service:
+    analyzer = request.app.state.analyzer
+    if not analyzer:
         return {"status": "error", "message": "Analyzer Service not initialized"}
 
-    return await analyzer_service.analyze_user_profile(user_id)
+    return await analyzer.analyze_user_profile(user_id)
+
 
 @app.post("/cron/analyze-all")
-async def analyze_all_users_cron():
+async def analyze_all_users_cron(request: Request):
     """
     Эндпоинт для ежедневного анализа ВСЕХ пользователей.
-    Cloud Scheduler вызывает этот эндпоинт раз в сутки.
-
-    Returns:
-        dict: Статистика обработки.
     """
-    if not analyzer_service or not db_service:
+    analyzer = request.app.state.analyzer
+    db = request.app.state.db
+    if not analyzer or not db:
         return {"status": "error", "message": "Services not initialized"}
 
     try:
-        # Получаем список всех пользователей
-        user_ids = await db_service.get_all_user_ids()
-        
+        user_ids = await db.get_all_user_ids()
+
         if not user_ids:
             return {"status": "ok", "message": "No users to analyze", "processed": 0}
-        
-        # Анализируем каждого пользователя
+
         results = {"success": 0, "failed": 0, "skipped": 0}
-        
+
         for user_id in user_ids:
             try:
-                result = await analyzer_service.analyze_user_profile(user_id)
+                result = await analyzer.analyze_user_profile(user_id)
                 if result.get("status") == "success":
                     results["success"] += 1
                 elif result.get("status") == "skipped":
@@ -206,101 +235,99 @@ async def analyze_all_users_cron():
             except Exception as e:
                 logger.error(f"Ошибка анализа пользователя {user_id}: {e}")
                 results["failed"] += 1
-        
+
         logger.info(f"Batch analysis complete: {results}")
         return {"status": "ok", "processed": len(user_ids), "results": results}
-        
+
     except Exception as e:
         logger.error(f"Ошибка batch-анализа: {e}")
         return {"status": "error", "message": str(e)}
 
+
 @app.post("/cron/weekly-digest")
-async def send_weekly_digest():
+async def send_weekly_digest(request: Request):
     """
     Эндпоинт для отправки еженедельных итогов всем пользователям.
-    Cloud Scheduler вызывает этот эндпоинт раз в неделю (пятница).
-
-    Returns:
-        dict: Статистика отправки.
     """
-    if not db_service or not ai_engine or not bot_app:
+    db = request.app.state.db
+    ai_engine = request.app.state.ai_engine
+    bot_app = request.app.state.bot_app
+    if not db or not ai_engine or not bot_app:
         return {"status": "error", "message": "Services not initialized"}
 
     try:
-        user_ids = await db_service.get_all_user_ids()
-        
+        user_ids = await db.get_all_user_ids()
+
         if not user_ids:
             return {"status": "ok", "message": "No users", "sent": 0}
-        
+
         sent_count = 0
-        
+
         for user_id in user_ids:
             try:
-                # Получаем профиль пользователя
-                user_data = await db_service.get_user(user_id)
-                
+                user_data = await db.get_user(user_id)
+
                 if not user_data or not user_data.get('profile_summary'):
-                    continue  # Пропускаем пользователей без профиля
-                
+                    continue
+
                 profile = user_data.get('profile_summary', {})
                 first_name = user_data.get('first_name', 'друг')
-                
-                # Формируем краткий дайджест
+
                 digest_text = f"📊 <b>Твои итоги недели, {first_name}!</b>\n\n"
-                
+
                 if profile.get('summary'):
                     digest_text += f"📝 {profile['summary'][:200]}...\n\n" if len(profile.get('summary', '')) > 200 else f"📝 {profile['summary']}\n\n"
-                
+
                 if profile.get('dreams'):
-                    dreams = profile['dreams'][:3]  # Первые 3 мечты
+                    dreams = profile['dreams'][:3]
                     digest_text += "💭 <b>Твои цели:</b>\n"
                     for dream in dreams:
                         digest_text += f"  • {dream}\n"
                     digest_text += "\nКак продвигаешься? Напиши мне!"
                 else:
                     digest_text += "Расскажи о своих целях, и я помогу их достичь! 🚀"
-                
-                # Отправляем сообщение через Telegram
+
                 await bot_app.bot.send_message(
                     chat_id=user_id,
                     text=digest_text,
                     parse_mode="HTML"
                 )
                 sent_count += 1
-                
+
             except Exception as e:
                 logger.warning(f"Не удалось отправить дайджест пользователю {user_id}: {e}")
                 continue
-        
+
         logger.info(f"Weekly digest sent to {sent_count} users")
         return {"status": "ok", "sent": sent_count, "total": len(user_ids)}
-        
+
     except Exception as e:
         logger.error(f"Ошибка отправки weekly digest: {e}")
         return {"status": "error", "message": str(e)}
 
+
 @app.get("/debug/memory/{user_id}")
-async def debug_memory(user_id: int, q: str = ""):
+async def debug_memory(request: Request, user_id: int, q: str = ""):
     """
     Отладочный эндпоинт для проверки памяти пользователя.
     GET /debug/memory/123 — статистика
     GET /debug/memory/123?q=тема — поиск по памяти
     """
-    if not memory_service:
+    memory = request.app.state.memory
+    if not memory:
         return {"status": "error", "message": "Memory Service not initialized"}
 
     try:
-        all_memories = await memory_service.get_all_memories(user_id, limit=100)
+        all_memories = await memory.get_all_memories(user_id, limit=100)
         stats = {"total": len(all_memories)}
 
         result = {"status": "ok", "user_id": user_id, "stats": stats}
 
         if q:
-            search_results = await memory_service.search_memory(user_id, q, limit=5)
+            search_results = await memory.search_memory(user_id, q, limit=5)
             result["search_query"] = q
             result["search_results"] = search_results
 
-        # Показать последние 5 записей
         result["recent"] = [
             {"memory": m.get("memory", "")[:200], "id": m.get("id", "")}
             for m in all_memories[:5]
@@ -310,21 +337,25 @@ async def debug_memory(user_id: int, q: str = ""):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
 @app.post("/cron/summarize-memory")
-async def summarize_memory_cron():
+async def summarize_memory_cron(request: Request):
     """
     Суммаризация старых сообщений в долговременной памяти.
-    Сжимает блоки по 30 сообщений в конспекты.
+    С Mem0 не требуется — дедупликация автоматическая.
     """
-    if not memory_service or not db_service or not ai_engine:
+    memory = request.app.state.memory
+    db = request.app.state.db
+    ai_engine = request.app.state.ai_engine
+    if not memory or not db or not ai_engine:
         return {"status": "error", "message": "Services not initialized"}
 
     try:
-        user_ids = await db_service.get_all_user_ids()
+        user_ids = await db.get_all_user_ids()
         summarized = 0
         for user_id in user_ids:
             try:
-                await memory_service.summarize_old_messages(user_id, ai_engine)
+                await memory.summarize_old_messages(user_id, ai_engine)
                 summarized += 1
             except Exception as e:
                 logger.warning(f"Ошибка суммаризации памяти для {user_id}: {e}")
@@ -334,9 +365,8 @@ async def summarize_memory_cron():
         logger.error(f"Ошибка cron summarize-memory: {e}")
         return {"status": "error", "message": str(e)}
 
+
 if __name__ == "__main__":
-    # Этот блок используется только для локальной отладки при прямом запуске файла python main.py
-    # В продакшене приложение запускается через uvicorn (см. Dockerfile)
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)

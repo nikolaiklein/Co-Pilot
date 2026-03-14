@@ -58,7 +58,9 @@ jobs:
           ALLOWED_USERS=ALLOWED_USERS:latest,\
           DEFAULT_MODEL=DEFAULT_MODEL:latest,\
           QDRANT_URL=QDRANT_URL:latest,\
-          QDRANT_API_KEY=QDRANT_API_KEY:latest"
+          QDRANT_API_KEY=QDRANT_API_KEY:latest,\
+          LITELLM_BASE_URL=LITELLM_BASE_URL:latest,\
+          LITELLM_API_KEY=LITELLM_API_KEY:latest"
 
       - name: Show deployed URL
         run: |

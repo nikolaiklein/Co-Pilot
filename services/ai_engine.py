@@ -1,5 +1,7 @@
 import os
+import re
 import logging
+import time
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str
 
 ## Доступные команды (напоминай при необходимости)
 - /myprofile — посмотреть своё досье
-- /model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
+- /model — переключить AI-модель (40+ моделей: Gemini, Claude, DeepSeek, Kimi, Llama и др.)
 - /memory search <запрос> — поиск по долговременной памяти
 - /name — дать боту персональное имя
 - /correct — исправить ошибку в профиле
@@ -320,13 +322,25 @@ class OpenAIProvider(BaseProvider):
 # --- OpenAI-совместимый провайдер (NVIDIA, MiniMax и др.) ---
 
 class OpenAICompatibleProvider(BaseProvider):
-    """Провайдер для любого OpenAI-совместимого API (NVIDIA, MiniMax и др.)."""
+    """Провайдер для любого OpenAI-совместимого API (NVIDIA, MiniMax, LiteLLM и др.)."""
 
     def __init__(self, api_key: str, model: str, base_url: str):
         import openai
-        self.client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=50.0)
         self.model = model
+        self._is_reasoning = self._check_reasoning(model)
         logger.info(f"OpenAICompatibleProvider инициализирован (модель: {model}, endpoint: {base_url})")
+
+    @staticmethod
+    def _check_reasoning(model: str) -> bool:
+        """Проверяет, является ли модель reasoning-моделью."""
+        reasoning_patterns = ["thinking", "reasoner"]
+        return any(p in model.lower() for p in reasoning_patterns)
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Убирает блоки <think>...</think> из ответа reasoning-моделей."""
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     async def generate(self, messages: list, system_prompt: str, temperature: float = 0.7) -> str:
         api_messages = [{"role": "system", "content": system_prompt}]
@@ -334,12 +348,36 @@ class OpenAICompatibleProvider(BaseProvider):
             role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
             api_messages.append({"role": role, "content": msg['content']})
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=api_messages,
-            temperature=temperature,
+        kwargs = {"model": self.model, "messages": api_messages}
+        if not self._is_reasoning:
+            kwargs["temperature"] = temperature
+
+        start_time = time.time()
+        response = await self.client.chat.completions.create(**kwargs)
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # Логирование метаданных (Task 8)
+        usage = response.usage
+        finish_reason = response.choices[0].finish_reason if response.choices else None
+        logger.info(
+            f"LLM call: model={response.model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"finish_reason={finish_reason} "
+            f"latency={latency_ms}ms"
         )
-        return response.choices[0].message.content or ""
+
+        content = response.choices[0].message.content or ""
+
+        # Strip thinking tokens из reasoning-моделей
+        if self._is_reasoning and content:
+            content = self._strip_thinking(content)
+
+        # Предупреждение при обрезанном ответе
+        if finish_reason == "length" and content:
+            content += "\n\n⚠️ _Ответ был обрезан из-за лимита модели._"
+
+        return content
 
     async def analyze(self, prompt: str) -> str:
         response = await self.client.chat.completions.create(
@@ -384,6 +422,11 @@ OPENAI_COMPATIBLE_PROVIDERS = {
         "base_url": "https://integrate.api.nvidia.com/v1",
         "default_model": "meta/llama-4-maverick-17b-128e-instruct",
     },
+    "litellm": {
+        "env_key": "LITELLM_API_KEY",
+        "base_url": os.getenv("LITELLM_BASE_URL", ""),
+        "default_model": "gemini-2.5-flash",
+    },
 }
 
 # Модели доступные через NVIDIA NIM (проверенные, рабочие)
@@ -415,6 +458,7 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
     "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
+    "litellm": "gemini-2.5-flash",
 }
 
 def parse_model_string(model_string: str) -> tuple[str, str]:
@@ -470,10 +514,16 @@ def create_provider(provider_name: str, model: str) -> BaseProvider:
         api_key = os.getenv(config["env_key"])
         if not api_key:
             raise ValueError(f"API ключ {config['env_key']} не задан")
+        # Для litellm base_url читаем из env динамически (может быть не задан при импорте)
+        base_url = config["base_url"]
+        if provider_name == "litellm":
+            base_url = os.getenv("LITELLM_BASE_URL", "")
+        if not base_url:
+            raise ValueError(f"Base URL для {provider_name} не задан")
         return OpenAICompatibleProvider(
             api_key=api_key,
             model=model,
-            base_url=config["base_url"],
+            base_url=base_url,
         )
 
     # Стандартные провайдеры
@@ -554,9 +604,9 @@ class AIEngine:
 
         try:
             system_prompt = build_system_prompt(user_profile, user_name)
-            # Контекст памяти добавляется в system prompt, а не в user message
+            # Контекст памяти — отделяем от инструкций структурными тегами
             if memory_context:
-                system_prompt += f"\n\n{memory_context}"
+                system_prompt = f"<instructions>\n{system_prompt}\n</instructions>\n\n<user_context>\n{memory_context}\n</user_context>"
             messages = list(history) + [{"role": "user", "content": user_text}]
             response = await provider.generate(messages, system_prompt)
             if response:
@@ -564,7 +614,8 @@ class AIEngine:
             logger.warning(f"Пустой ответ для пользователя {user_id}")
             return "Извините, я не смог сформировать ответ. Попробуйте еще раз."
         except Exception as e:
-            logger.error(f"Ошибка при генерации ответа для {user_id}: {e}")
+            # Не логируем полное сообщение ошибки — может содержать ключи API
+            logger.error(f"Ошибка при генерации ответа для {user_id}: {type(e).__name__}")
             return "Произошла ошибка при обращении к ИИ. Пожалуйста, повторите попытку позже."
 
     async def transcribe_audio(self, file_bytes: bytes) -> str:
@@ -577,13 +628,14 @@ class AIEngine:
             return "[Ошибка обработки аудио]"
 
     async def analyze_content(self, prompt: str) -> str:
-        """Анализирует контент через текущий провайдер."""
+        """Анализирует контент через дефолтный провайдер (Gemini). Не зависит от выбора пользователя."""
         try:
-            provider = self.get_provider()
+            # Всегда используем дефолтный провайдер — анализатор заточен под Gemini
+            provider = self.get_provider(self.default_provider_name, self.default_model)
             return await provider.analyze(prompt)
         except Exception as e:
             logger.error(f"Ошибка при анализе контента: {e}")
-            return f"[Ошибка анализа: {e}]"
+            return f"[Ошибка анализа]"
 
     async def analyze_image(
         self,
@@ -591,16 +643,37 @@ class AIEngine:
         user_message: str = "",
         user_profile: dict = None,
         user_name: str = None,
+        provider_name: str = None,
+        model: str = None,
     ) -> str:
-        """Анализирует изображение через текущий провайдер."""
+        """
+        Анализирует изображение. Если выбранная модель не поддерживает vision,
+        автоматически переключается на дефолтный Gemini.
+        """
         try:
-            provider = self.get_provider()
+            from services.model_catalog import get_model_meta
+
+            # Определяем, поддерживает ли выбранная модель vision
+            use_provider = provider_name
+            use_model = model
+            fallback_note = ""
+
+            if use_provider and use_model:
+                meta = get_model_meta(use_model)
+                if not meta.get("supports_vision", False):
+                    # Модель не поддерживает vision — fallback на дефолтный Gemini
+                    use_provider = self.default_provider_name
+                    use_model = self.default_model
+                    fallback_note = f"\n\n💡 _Модель {model} не поддерживает изображения. Использован {use_model}._"
+
+            provider = self.get_provider(use_provider, use_model)
             system_prompt = build_system_prompt(user_profile, user_name)
             if user_message:
                 prompt = f'Пользователь отправил изображение с сообщением: "{user_message}"\n\nОпиши что на изображении и ответь на сообщение пользователя.'
             else:
                 prompt = "Пользователь отправил изображение без текста. Опиши что на нём и спроси, чем можешь помочь."
-            return await provider.analyze_image(image_bytes, prompt, system_prompt)
+            result = await provider.analyze_image(image_bytes, prompt, system_prompt)
+            return result + fallback_note
         except Exception as e:
-            logger.error(f"Ошибка при анализе изображения: {e}")
+            logger.error(f"Ошибка при анализе изображения: {type(e).__name__}")
             return "Произошла ошибка при обработке изображения."
