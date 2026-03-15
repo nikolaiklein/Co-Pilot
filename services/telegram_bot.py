@@ -192,17 +192,24 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             return None
 
         def _build_recommendation_keyboard() -> InlineKeyboardMarkup:
-            """Строит inline keyboard с популярными моделями для рекомендации."""
-            buttons = [
-                [InlineKeyboardButton("✨ Gemini 2.5 Flash — быстрая", callback_data="mswitch:gemini-2.5-flash")],
-                [InlineKeyboardButton("✨ Gemini 2.5 Pro — мощная", callback_data="mswitch:gemini-2.5-pro")],
-                [InlineKeyboardButton("🟣 Claude Sonnet 4 — умная", callback_data="mswitch:claude")],
-                [InlineKeyboardButton("⚪ GPT-4o — универсальная", callback_data="mswitch:gpt")],
-                [InlineKeyboardButton("🔵 Kimi K2 — рассуждения", callback_data="mswitch:kimi-k2")],
-                [InlineKeyboardButton("🟠 DeepSeek V3 — код и анализ", callback_data="mswitch:deepseek-v3.2")],
-                [InlineKeyboardButton("📋 Все модели (40+) →", callback_data="mc:categories")],
-                [InlineKeyboardButton("✅ Оставить текущую", callback_data="mswitch:keep")],
+            """Строит inline keyboard с популярными моделями — только доступные."""
+            import os
+            # Список популярных моделей с проверкой доступности
+            _popular = [
+                ("✨ Gemini 2.5 Flash — быстрая", "mswitch:gemini-2.5-flash", "GEMINI_API_KEY"),
+                ("✨ Gemini 2.5 Pro — мощная", "mswitch:gemini-2.5-pro", "GEMINI_API_KEY"),
+                ("🟣 Claude Sonnet 4 — умная", "mswitch:claude", "ANTHROPIC_API_KEY"),
+                ("⚪ GPT-4o — универсальная", "mswitch:gpt", "OPENAI_API_KEY"),
+                ("🔵 Kimi K2 — рассуждения", "mswitch:kimi-k2", "NVIDIA_API_KEY"),
+                ("🟠 DeepSeek V3 — код и анализ", "mswitch:deepseek-v3.2", "NVIDIA_API_KEY"),
             ]
+            buttons = []
+            for label, callback, env_key in _popular:
+                if os.getenv(env_key):
+                    buttons.append([InlineKeyboardButton(label, callback_data=callback)])
+
+            buttons.append([InlineKeyboardButton("📋 Все модели →", callback_data="mc:categories")])
+            buttons.append([InlineKeyboardButton("✅ Оставить текущую", callback_data="mswitch:keep")])
             return InlineKeyboardMarkup(buttons)
 
         # Общая функция для обработки логики диалога (используется для текста и голоса)
@@ -310,11 +317,16 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     "переключи", "смени модель", "поставь модель", "switch",
                 ]
                 _recommend_keywords = [
-                    "подбери модель", "какая модель", "какую модель",
-                    "модель лучше", "рекомендуй модель", "посоветуй модель",
+                    "подбери модель", "модель лучше", "рекомендуй модель",
+                    "посоветуй модель", "предложи модель",
+                ]
+                # "какая модель" — это вопрос о текущей, не рекомендация
+                _info_keywords = [
+                    "какая модель", "какую модель", "какая у тебя модель",
+                    "на какой модели", "текущая модель",
                 ]
                 user_text_lower = user_text.lower()
-                if any(kw in user_text_lower for kw in _switch_keywords + _recommend_keywords):
+                if any(kw in user_text_lower for kw in _switch_keywords + _recommend_keywords + _info_keywords):
                     model_context = _build_model_context_for_prompt(model_catalog)
                 if any(kw in user_text_lower for kw in _recommend_keywords):
                     is_recommend_intent = True
