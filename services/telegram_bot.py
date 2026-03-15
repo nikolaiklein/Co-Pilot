@@ -360,6 +360,20 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                             logger.error(f"Ошибка переключения модели для {user.id}: {switch_err}")
                             response_text += "\n\n⚠️ Не удалось переключить модель."
 
+                    elif action.type == "vault_save":
+                        try:
+                            await db_service.vault_save(
+                                user.id,
+                                action.vault_title,
+                                action.vault_content,
+                                item_type=action.vault_type,
+                            )
+                            type_label = {"prompt": "Промпт", "idea": "Идея", "note": "Заметка"}
+                            response_text += f"\n\n✅ {type_label.get(action.vault_type, 'Заметка')} сохранена в /vault"
+                        except Exception as vault_err:
+                            logger.error(f"Vault save via tag error for {user.id}: {vault_err}")
+                            response_text += "\n\n⚠️ Не удалось сохранить в хранилище."
+
                 # Генерируем footnote если провайдер сменился (ротация)
                 rotation_footnote = format_rotation_footnote(
                     req_provider, req_model, actual_provider, actual_model
