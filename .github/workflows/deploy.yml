@@ -47,9 +47,11 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --memory 512Mi \
+            --memory 768Mi \
             --min-instances 0 \
             --max-instances 3 \
+            --concurrency 10 \
+            --timeout 60 \
             --set-env-vars "LOG_LEVEL=INFO" \
             --set-secrets "\
           TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,\

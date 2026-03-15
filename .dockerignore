@@ -1,0 +1,27 @@
+# Secrets
+.env*
+
+# Git
+.git/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Council / specs
+.council/
+specs/
+
+# Docs (keep README)
+PLAN-*.md
+DOCS.md
+ROADMAP*.md
+
+# Tests
+tests/
+test_*.py
+
+# IDE
+.vscode/
+.idea/

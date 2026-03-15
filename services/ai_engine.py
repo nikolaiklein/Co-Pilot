@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 # --- Системный промпт ---
 
-def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str:
+def build_system_prompt(user_profile: dict = None, user_name: str = None, model_context: str = None) -> str:
     """
     Генерирует системный промпт, адаптированный под профиль пользователя.
     """
@@ -65,11 +65,18 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str
 ## Доступные команды (напоминай при необходимости)
 - /myprofile — посмотреть своё досье
 - /model — переключить AI-модель (40+ моделей: Gemini, Claude, DeepSeek, Kimi, Llama и др.)
+- /vault — персональное хранилище (промпты, идеи, заметки)
 - /memory search <запрос> — поиск по долговременной памяти
 - /name — дать боту персональное имя
 - /correct — исправить ошибку в профиле
 - /clear — очистить историю диалога
 - /help — список всех команд
+
+## Хранилище (Vault)
+У пользователя есть персональное хранилище для промптов, идей и заметок.
+Когда пользователь говорит "сохрани", "запиши", "запомни идею", "сохрани промпт" —
+предложи сохранить в хранилище. Спроси краткий заголовок и тип (промпт/идея/заметка).
+Пользователь может посмотреть сохранённое через /vault.
 """
 
     has_profile = (
@@ -105,7 +112,27 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None) -> str
         elif isinstance(summary, str) and summary:
             personal_section += f"📝 **Заметки**: {summary}\n"
 
-    return base_prompt + mode_hint + personal_section
+    # Инструкции по переключению моделей (только если model_context передан)
+    model_switch_section = ""
+    if model_context:
+        model_switch_section = f"""
+## Переключение моделей
+Когда пользователь ЯВНО просит переключить модель (например, "переключи на Claude",
+"поставь Kimi", "смени модель на GPT"), добавь в конец ответа тег:
+[SWITCH_MODEL: model_id]
+
+Доступные модели:
+{model_context}
+
+Правила:
+- Используй тег ТОЛЬКО при явном запросе на переключение.
+- НЕ используй тег, если пользователь просто упоминает модель в разговоре.
+- НЕ используй тег в ответах на рекомендации — только описывай модели.
+- Скажи "Переключаю на [название]" и поставь тег в конце.
+- Не объясняй тег пользователю.
+"""
+
+    return base_prompt + mode_hint + personal_section + model_switch_section
 
 
 # --- Абстрактный провайдер ---
@@ -159,11 +186,25 @@ class GeminiProvider(BaseProvider):
             temperature=temperature,
         )
 
+        start_time = time.time()
         response = await self.client.aio.models.generate_content(
             model=self.model,
             contents=contents,
             config=config
         )
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # EC-4: логирование метаданных LLM-вызова
+        usage = getattr(response, 'usage_metadata', None)
+        finish_reason = getattr(response.candidates[0], 'finish_reason', None) if response.candidates else None
+        logger.info(
+            f"LLM call: model={self.model} "
+            f"prompt_tokens={getattr(usage, 'prompt_token_count', '?') if usage else '?'} "
+            f"completion_tokens={getattr(usage, 'candidates_token_count', '?') if usage else '?'} "
+            f"finish_reason={finish_reason} "
+            f"latency={latency_ms}ms"
+        )
+
         return response.text if response.text else ""
 
     async def analyze(self, prompt: str) -> str:
@@ -222,6 +263,7 @@ class ClaudeProvider(BaseProvider):
             role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
             api_messages.append({"role": role, "content": msg['content']})
 
+        start_time = time.time()
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=4096,
@@ -229,6 +271,18 @@ class ClaudeProvider(BaseProvider):
             messages=api_messages,
             temperature=temperature,
         )
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # EC-4: логирование метаданных LLM-вызова
+        usage = getattr(response, 'usage', None)
+        logger.info(
+            f"LLM call: model={self.model} "
+            f"prompt_tokens={getattr(usage, 'input_tokens', '?') if usage else '?'} "
+            f"completion_tokens={getattr(usage, 'output_tokens', '?') if usage else '?'} "
+            f"finish_reason={response.stop_reason} "
+            f"latency={latency_ms}ms"
+        )
+
         return response.content[0].text if response.content else ""
 
     async def analyze(self, prompt: str) -> str:
@@ -274,11 +328,25 @@ class OpenAIProvider(BaseProvider):
             role = msg['role'] if msg['role'] in ('user', 'assistant') else 'user'
             api_messages.append({"role": role, "content": msg['content']})
 
+        start_time = time.time()
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=api_messages,
             temperature=temperature,
         )
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # EC-4: логирование метаданных LLM-вызова
+        usage = response.usage
+        finish_reason = response.choices[0].finish_reason if response.choices else None
+        logger.info(
+            f"LLM call: model={response.model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"finish_reason={finish_reason} "
+            f"latency={latency_ms}ms"
+        )
+
         return response.choices[0].message.content or ""
 
     async def analyze(self, prompt: str) -> str:
@@ -429,37 +497,8 @@ OPENAI_COMPATIBLE_PROVIDERS = {
     },
 }
 
-# Модели доступные через NVIDIA NIM (проверенные, рабочие)
-NVIDIA_MODELS = {
-    "llama-4-maverick": "meta/llama-4-maverick-17b-128e-instruct",
-    "kimi-k2": "moonshotai/kimi-k2-instruct",
-    "kimi-k2.5": "moonshotai/kimi-k2.5",
-    "deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
-    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
-    "nemotron-ultra": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "mistral-large-3": "mistralai/mistral-large-3-675b-instruct-2512",
-    "minimax-m2.5": "minimaxai/minimax-m2.5",
-}
-
-# Доступные Gemini модели (проверенные, рабочие)
-GEMINI_MODELS = {
-    "gemini-3-flash": "gemini-3-flash-preview",
-    "gemini-3-pro": "gemini-3-pro-preview",
-    "gemini-3.1-pro": "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash": "gemini-2.5-flash",
-    "gemini-2.5-pro": "gemini-2.5-pro",
-    "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
-    "gemini-2.0-flash": "gemini-2.0-flash",
-}
-
-DEFAULT_MODELS = {
-    "gemini": "gemini-3-flash-preview",
-    "anthropic": "claude-sonnet-4-20250514",
-    "openai": "gpt-4o",
-    "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
-    "litellm": "gemini-2.5-flash",
-}
+# Импорт модельных данных из единого источника (model_catalog.py)
+from services.model_catalog import NVIDIA_MODELS, GEMINI_MODELS, DEFAULT_MODELS
 
 def parse_model_string(model_string: str) -> tuple[str, str]:
     """

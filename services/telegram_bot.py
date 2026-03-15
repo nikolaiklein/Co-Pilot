@@ -87,7 +87,7 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list:
 # Однако, для чистоты, будем использовать Any или просто duck typing.
 # from services.ai_engine import AIEngine
 
-async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None, memory_service=None) -> Application:
+async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None, memory_service=None, model_catalog=None) -> Application:
     """
     Создает и настраивает приложение Telegram бота.
     Регистрирует обработчики сообщений.
@@ -136,6 +136,75 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         # Множество пользователей в режиме bulk-загрузки
         bulk_mode_users: dict[int, int] = {}  # user_id -> count загруженных записей
 
+        def _build_model_context_for_prompt(catalog) -> str | None:
+            """Строит компактный блок доступных моделей для system prompt (Willison: curate, не dump)."""
+            from services.model_catalog import MODEL_FAMILY_META, NVIDIA_MODELS, GEMINI_MODELS
+            lines = []
+            # Короткие имена из GEMINI_MODELS и NVIDIA_MODELS
+            for short_name in GEMINI_MODELS:
+                lines.append(f"- {short_name} (Gemini)")
+            for short_name in NVIDIA_MODELS:
+                family = "NVIDIA"
+                for prefix, meta in MODEL_FAMILY_META.items():
+                    if short_name.startswith(prefix):
+                        family = meta.get("label", "NVIDIA")
+                        break
+                lines.append(f"- {short_name} ({family})")
+            # Прямые провайдеры
+            lines.append("- claude (Claude)")
+            lines.append("- gpt (OpenAI GPT)")
+            return "\n".join(lines) if lines else None
+
+        async def _resolve_and_switch_model(user_id: int, model_id: str, db_svc, catalog, engine) -> str | None:
+            """
+            Резолвит model_id и сохраняет в Firestore. Возвращает resolved model string или None.
+            """
+            from services.ai_engine import parse_model_string
+            from services.model_catalog import NVIDIA_MODELS, GEMINI_MODELS
+
+            # Пробуем как короткое имя Gemini/NVIDIA
+            if model_id in GEMINI_MODELS:
+                selected = f"gemini/{GEMINI_MODELS[model_id]}"
+                await db_svc.update_user(user_id, {"selected_model": selected})
+                return model_id
+            if model_id in NVIDIA_MODELS:
+                selected = f"nvidia/{NVIDIA_MODELS[model_id]}"
+                await db_svc.update_user(user_id, {"selected_model": selected})
+                return model_id
+
+            # Пробуем через parse_model_string
+            provider, model = parse_model_string(model_id)
+            if provider and model:
+                # Валидация: проверяем в каталоге LiteLLM
+                if catalog and catalog.is_available:
+                    models = await catalog.get_models()
+                    if model_id in models:
+                        await db_svc.update_user(user_id, {"selected_model": f"litellm/{model_id}"})
+                        return model_id
+                # Пробуем через провайдер
+                try:
+                    engine.get_provider(provider, model)
+                    await db_svc.update_user(user_id, {"selected_model": f"{provider}/{model}"})
+                    return model_id
+                except ValueError:
+                    pass
+
+            return None
+
+        def _build_recommendation_keyboard() -> InlineKeyboardMarkup:
+            """Строит inline keyboard с популярными моделями для рекомендации."""
+            from services.model_catalog import MODEL_FAMILY_META
+            buttons = [
+                [InlineKeyboardButton("✨ Gemini Flash", callback_data="mswitch:gemini-2.5-flash"),
+                 InlineKeyboardButton("✨ Gemini Pro", callback_data="mswitch:gemini-2.5-pro")],
+                [InlineKeyboardButton("🟣 Claude", callback_data="mswitch:claude"),
+                 InlineKeyboardButton("⚪ GPT-4o", callback_data="mswitch:gpt")],
+                [InlineKeyboardButton("🔵 Kimi K2", callback_data="mswitch:kimi-k2"),
+                 InlineKeyboardButton("🟠 DeepSeek", callback_data="mswitch:deepseek-v3.2")],
+                [InlineKeyboardButton("Оставить текущую", callback_data="mswitch:keep")],
+            ]
+            return InlineKeyboardMarkup(buttons)
+
         # Общая функция для обработки логики диалога (используется для текста и голоса)
         async def process_dialog_turn(user, chat_id, user_text, context):
             try:
@@ -155,6 +224,35 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                         await context.bot.send_message(chat_id=chat_id, text="❌ Memory Service не доступен.")
                     return
 
+                # 0.5. Быстрое сохранение в vault: "Запиши идею: текст"
+                vault_match = _vault_save_patterns.match(user_text.strip())
+                if vault_match:
+                    content = vault_match.group(1).strip()
+                    if content:
+                        # Определяем тип по ключевому слову
+                        lower = user_text.lower()
+                        if "промпт" in lower:
+                            item_type = "prompt"
+                        elif "идею" in lower or "идея" in lower:
+                            item_type = "idea"
+                        else:
+                            item_type = "note"
+                        title = content[:60] + ("..." if len(content) > 60 else "")
+                        try:
+                            await db_service.vault_save(user.id, title, content, item_type=item_type)
+                            type_label = {"prompt": "Промпт", "idea": "Идея", "note": "Заметка"}
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ {type_label[item_type]} сохранена в хранилище: <b>{html.escape(title)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except ValueError as e:
+                            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {e}")
+                        except Exception as e:
+                            logger.error(f"Vault quick-save error for {user.id}: {e}")
+                            await context.bot.send_message(chat_id=chat_id, text="⚠️ Не удалось сохранить.")
+                        return
+
                 # 1. Получаем или создаем пользователя в БД
                 user_data = {
                     "id": user.id,
@@ -167,7 +265,10 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 db_user = await db_service.get_or_create_user(user.id, user_data)
 
                 # 2. Сохраняем сообщение пользователя
-                await db_service.save_message(user.id, "user", user_text)
+                try:
+                    await db_service.save_message(user.id, "user", user_text)
+                except Exception as save_err:
+                    logger.warning(f"Не удалось сохранить сообщение пользователя {user.id}: {save_err}")
 
                 # 3. Отправляем действие "печатает" (typing)
                 await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -197,20 +298,78 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     except Exception as mem_err:
                         logger.warning(f"Memory search error: {mem_err}")
 
-                # 6. Генерируем ответ (контекст памяти идёт в system prompt)
-                response_text = await ai_engine.generate_response(
-                    user_id=user.id,
-                    user_text=user_text,
-                    history=history_for_ai,
-                    user_profile=db_user,
-                    user_name=user.first_name,
-                    provider_name=user_provider,
-                    model=user_model,
-                    memory_context=memory_context if memory_context else None,
+                # 6. Генерируем ответ с авто-ротацией
+                from services.ai_engine import build_system_prompt
+                from services.model_rotation import generate_with_fallback, format_rotation_footnote
+                from services.response_tags import parse_response_tags
+
+                # Детектируем intent на модель — inject model_context
+                model_context = None
+                is_recommend_intent = False
+                _switch_keywords = [
+                    "переключи", "смени модель", "поставь модель", "switch",
+                ]
+                _recommend_keywords = [
+                    "подбери модель", "какая модель", "какую модель",
+                    "модель лучше", "рекомендуй модель", "посоветуй модель",
+                ]
+                user_text_lower = user_text.lower()
+                if any(kw in user_text_lower for kw in _switch_keywords + _recommend_keywords):
+                    model_context = _build_model_context_for_prompt(model_catalog)
+                if any(kw in user_text_lower for kw in _recommend_keywords):
+                    is_recommend_intent = True
+
+                system_prompt = build_system_prompt(db_user, user.first_name, model_context=model_context)
+                if memory_context:
+                    system_prompt = f"<instructions>\n{system_prompt}\n</instructions>\n\n<user_context>\n{memory_context}\n</user_context>"
+
+                req_provider = user_provider or ai_engine.default_provider_name
+                req_model = user_model or ai_engine.default_model
+                messages_for_ai = list(history_for_ai) + [{"role": "user", "content": user_text}]
+
+                response_text, actual_provider, actual_model = await generate_with_fallback(
+                    ai_engine=ai_engine,
+                    model_catalog=model_catalog,
+                    provider_name=req_provider,
+                    model=req_model,
+                    messages=messages_for_ai,
+                    system_prompt=system_prompt,
+                    timeout=10.0,
                 )
 
-                # 6. Сохраняем ответ ассистента
-                await db_service.save_message(user.id, "assistant", response_text)
+                # 6a. Парсим теги из ответа (Willison: separate parsing from execution)
+                tag_result = parse_response_tags(response_text, model_catalog)
+                response_text = tag_result.clean_text  # Чистый текст без тегов
+
+                # 6b. Выполняем действия из тегов
+                for action in tag_result.actions:
+                    if action.type == "switch_model":
+                        try:
+                            resolved = await _resolve_and_switch_model(
+                                user.id, action.model_id, db_service, model_catalog, ai_engine
+                            )
+                            if resolved:
+                                from services.model_catalog import MODEL_HINTS
+                                display_name = MODEL_HINTS.get(resolved, resolved)
+                                response_text += f"\n\n✅ Модель переключена: {display_name}"
+                            else:
+                                response_text += f"\n\n⚠️ Модель {action.model_id} сейчас недоступна, оставляю текущую."
+                        except Exception as switch_err:
+                            logger.error(f"Ошибка переключения модели для {user.id}: {switch_err}")
+                            response_text += "\n\n⚠️ Не удалось переключить модель."
+
+                # Добавляем footnote если провайдер сменился (ротация)
+                rotation_footnote = format_rotation_footnote(
+                    req_provider, req_model, actual_provider, actual_model
+                )
+                if rotation_footnote:
+                    response_text += rotation_footnote
+
+                # 6c. Сохраняем ЧИСТЫЙ ответ ассистента (без тегов — предотвращает context poisoning)
+                try:
+                    await db_service.save_message(user.id, "assistant", response_text)
+                except Exception as save_err:
+                    logger.warning(f"Не удалось сохранить ответ ассистента для {user.id}: {save_err}")
 
                 # 6.1 Сохраняем в долговременную память (фоново, Mem0 извлекает факты)
                 if memory_service:
@@ -231,14 +390,23 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
                 # 7. Форматируем и отправляем ответ
                 formatted_response = markdown_to_telegram_html(response_text)
+
+                # Если это рекомендация — добавляем inline keyboard для выбора модели
+                recommend_keyboard = None
+                if is_recommend_intent and not tag_result.actions:
+                    recommend_keyboard = _build_recommendation_keyboard()
+
                 message_parts = split_message(formatted_response)
-                
-                for part in message_parts:
+
+                for i, part in enumerate(message_parts):
+                    # Клавиатуру добавляем только к последней части
+                    reply_markup = recommend_keyboard if (i == len(message_parts) - 1 and recommend_keyboard) else None
                     try:
                         await context.bot.send_message(
-                            chat_id=chat_id, 
-                            text=part, 
-                            parse_mode=ParseMode.HTML
+                            chat_id=chat_id,
+                            text=part,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=reply_markup,
                         )
                     except Exception as send_error:
                         # Если не удалось отправить с HTML, отправляем без форматирования
@@ -376,6 +544,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 /help — показать это сообщение
 /myprofile — посмотреть моё досье (навыки, интересы, мечты)
 /model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
+/vault — персональное хранилище (промпты, идеи, заметки)
 /memory — статистика и поиск по долговременной памяти
 /bulk — режим массовой загрузки данных (текст, файлы)
 /name — дать мне имя (например: /name Макс)
@@ -570,7 +739,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 try:
                     corrected_profile = json.loads(corrected_json)
                     await db_service.update_user(user.id, {"profile_summary": corrected_profile})
-                    
+
                     await update.message.reply_text(
                         "✅ <b>Профиль обновлён!</b>\n\n"
                         f"Применено: {correction_request}\n\n"
@@ -580,6 +749,11 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 except json.JSONDecodeError:
                     await update.message.reply_text(
                         "⚠️ Не удалось обработать запрос. Попробуй сформулировать иначе."
+                    )
+                except Exception as db_err:
+                    logger.error(f"Ошибка сохранения профиля для {user.id}: {db_err}")
+                    await update.message.reply_text(
+                        "⚠️ Не удалось сохранить изменения профиля. Попробуй ещё раз."
                     )
                     
             except Exception as e:
@@ -597,22 +771,11 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         async def _build_categories_keyboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             """Строит клавиатуру категорий моделей (первый экран /model)."""
-            from services.model_catalog import get_model_meta, MODEL_HINTS, FAMILY_ORDER
+            from services.model_catalog import get_model_meta, MODEL_HINTS, FAMILY_ORDER, GEMINI_MODELS, NVIDIA_MODELS
 
             current = await _get_current_model(user_id)
-            catalog = getattr(ai_engine, '_model_catalog', None)
 
-            # Пытаемся получить каталог из app.state (ModelCatalog инициализирован в main.py)
-            if not catalog:
-                try:
-                    from main import app as fastapi_app
-                    catalog = getattr(fastapi_app.state, 'model_catalog', None)
-                except Exception:
-                    catalog = None
-
-            if not catalog or not catalog.is_available:
-                # Fallback: нет LiteLLM — показываем старые провайдеры текстом
-                from services.ai_engine import GEMINI_MODELS, NVIDIA_MODELS
+            if not model_catalog or not model_catalog.is_available:
                 lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n"]
                 lines.append("🔵 <b>Gemini:</b>")
                 for short_name in GEMINI_MODELS:
@@ -660,17 +823,10 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             current = await _get_current_model(user_id)
             current_model = current.split("/", 1)[-1] if "/" in current else current
 
-            catalog = None
-            try:
-                from main import app as fastapi_app
-                catalog = getattr(fastapi_app.state, 'model_catalog', None)
-            except Exception:
-                pass
-
-            if not catalog:
+            if not model_catalog:
                 return "❌ Каталог моделей недоступен.", InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mback")]])
 
-            groups = await catalog.get_models_grouped()
+            groups = await model_catalog.get_models_grouped()
             models = groups.get(family, [])
 
             if not models:
@@ -705,9 +861,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             /model litellm/claude-opus-4.6 — переключить на конкретную LiteLLM модель
             """
             from services.ai_engine import (
-                DEFAULT_MODELS, OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP,
-                NVIDIA_MODELS, GEMINI_MODELS, parse_model_string,
+                OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP, parse_model_string,
             )
+            from services.model_catalog import DEFAULT_MODELS, NVIDIA_MODELS, GEMINI_MODELS
             user = update.effective_user
             if not is_authorized(user.id):
                 return
@@ -724,18 +880,16 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             model_string = " ".join(args).strip()
 
             # Сначала проверяем, есть ли модель в LiteLLM каталоге
-            catalog = None
-            try:
-                from main import app as fastapi_app
-                catalog = getattr(fastapi_app.state, 'model_catalog', None)
-            except Exception:
-                pass
-
-            if catalog and catalog.is_available:
-                models = await catalog.get_models()
+            if model_catalog and model_catalog.is_available:
+                models = await model_catalog.get_models()
                 if model_string in models:
                     # Прямое совпадение с LiteLLM моделью
-                    await db_service.update_user(user.id, {"selected_model": f"litellm/{model_string}"})
+                    try:
+                        await db_service.update_user(user.id, {"selected_model": f"litellm/{model_string}"})
+                    except Exception as db_err:
+                        logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                        await update.message.reply_text("⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.")
+                        return
                     await update.message.reply_text(
                         f"✅ Модель: <code>litellm/{model_string}</code>",
                         parse_mode=ParseMode.HTML
@@ -763,6 +917,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 )
             except ValueError as e:
                 await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.HTML)
+            except Exception as db_err:
+                logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                await update.message.reply_text("⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.")
 
         application.add_handler(CommandHandler("model", handle_model))
 
@@ -982,6 +1139,114 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         application.add_handler(CommandHandler("admin", handle_admin))
 
+        # --- Vault (персональное хранилище) ---
+
+        async def handle_vault(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Обрабатывает команду /vault."""
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            args = context.args
+
+            # /vault save <title> — быстрое сохранение последнего ответа
+            if args and args[0].lower() == "save":
+                title = " ".join(args[1:]).strip() if len(args) > 1 else ""
+                if not title:
+                    await update.message.reply_text(
+                        "⚠️ Укажи заголовок: <code>/vault save Название</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+
+                # Берём последнее сообщение ассистента
+                history = await db_service.get_last_messages(user.id, limit=5)
+                last_assistant = None
+                for msg in reversed(history):
+                    if msg.get('role') == 'assistant':
+                        last_assistant = msg.get('content', '')
+                        break
+
+                if not last_assistant:
+                    await update.message.reply_text("⚠️ Нет недавних ответов для сохранения.")
+                    return
+
+                try:
+                    doc_id = await db_service.vault_save(
+                        user.id, title, last_assistant, item_type="note"
+                    )
+                    preview = last_assistant[:100] + "..." if len(last_assistant) > 100 else last_assistant
+                    await update.message.reply_text(
+                        f"✅ Сохранено в хранилище\n\n"
+                        f"<b>{html.escape(title)}</b>\n"
+                        f"<i>{html.escape(preview)}</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except ValueError as e:
+                    await update.message.reply_text(f"⚠️ {e}")
+                except Exception as e:
+                    logger.error(f"Vault save error for {user.id}: {e}")
+                    await update.message.reply_text("⚠️ Не удалось сохранить. Попробуй позже.")
+                return
+
+            # /vault — показать список или empty state
+            try:
+                items = await db_service.vault_list(user.id, limit=10)
+            except Exception as e:
+                logger.error(f"Vault list error for {user.id}: {e}")
+                await update.message.reply_text("⚠️ Ошибка загрузки хранилища.")
+                return
+
+            if not items:
+                await update.message.reply_text(
+                    "📦 <b>Хранилище пусто</b>\n\n"
+                    "Здесь можно сохранять промпты, идеи и заметки.\n\n"
+                    "👉 <code>/vault save Название</code> — сохранить последний ответ\n"
+                    "👉 Скажи мне «сохрани это как промпт» — я помогу\n"
+                    "👉 <code>Запиши идею: текст идеи</code> — быстрая заметка",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # Отображаем список
+            type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+            lines = ["📦 <b>Твоё хранилище</b>\n"]
+            buttons = []
+            for item in items:
+                emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                title = item.get('title', 'Без названия')[:40]
+                date_str = ""
+                if item.get('created_at'):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(item['created_at'].replace('+00:00', ''))
+                        date_str = dt.strftime("%d.%m")
+                    except Exception:
+                        pass
+                preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                lines.append(f"{emoji} <b>{html.escape(title)}</b> {date_str}\n<i>{html.escape(preview)}</i>\n")
+                buttons.append([InlineKeyboardButton(
+                    f"{emoji} {title}",
+                    callback_data=f"vault:view:{item['id'][:20]}"
+                )])
+
+            # Кнопка пагинации если 10 элементов (может быть ещё)
+            if len(items) == 10:
+                last_id = items[-1]['id']
+                buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+            text = "\n".join(lines)
+            keyboard = InlineKeyboardMarkup(buttons)
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+        application.add_handler(CommandHandler("vault", handle_vault))
+
+        # --- Vault dialog save (обработка фразы "Запиши идею: ..." в process_dialog_turn) ---
+        _vault_save_patterns = re.compile(
+            r'^(?:запиши|сохрани)\s+(?:идею|промпт|заметку)\s*[:：]\s*(.+)',
+            re.IGNORECASE | re.DOTALL,
+        )
+
         async def extract_text_from_file(file_bytes: bytes, file_name: str) -> str | None:
             """Извлекает текст из файла по расширению."""
             ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else ''
@@ -1177,7 +1442,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
 🎯 <b>Учусь понимать тебя</b> — собираю профиль из диалогов
 📋 /myprofile — твоё досье
-✏️ /correct — исправить ошибку в профиле  
+📦 /vault — хранилище промптов и идей
+✏️ /correct — исправить ошибку в профиле
 🏷 /name — дать мне имя
 🗑 /clear — очистить историю
 
@@ -1225,14 +1491,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     # ms: — модель выбрана
                     model_id = data[3:]
                     # Проверяем, что модель ещё есть в каталоге
-                    catalog = None
-                    try:
-                        from main import app as fastapi_app
-                        catalog = getattr(fastapi_app.state, 'model_catalog', None)
-                    except Exception:
-                        pass
-                    if catalog and catalog.is_available:
-                        models = await catalog.get_models()
+                    if model_catalog and model_catalog.is_available:
+                        models = await model_catalog.get_models()
                         if model_id not in models:
                             text = f"⚠️ Модель <code>{model_id}</code> больше недоступна.\n\nВыбери другую:"
                             keyboard = InlineKeyboardMarkup([
@@ -1244,7 +1504,19 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                                 await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
                             return
 
-                    await db_service.update_user(user.id, {"selected_model": f"litellm/{model_id}"})
+                    try:
+                        await db_service.update_user(user.id, {"selected_model": f"litellm/{model_id}"})
+                    except Exception as db_err:
+                        logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                        text = "⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз."
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                        ])
+                        try:
+                            await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                        except Exception:
+                            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                        return
                     logger.info(f"Пользователь {user.id} выбрал модель: litellm/{model_id}")
                     from services.model_catalog import get_model_meta, MODEL_HINTS
                     meta = get_model_meta(model_id)
@@ -1259,6 +1531,257 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
                 except Exception:
                     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+            # --- Recommendation switch callbacks (mswitch:) ---
+            elif data.startswith("mswitch:"):
+                if not is_authorized(user.id):
+                    return
+
+                choice = data[8:]  # after "mswitch:"
+
+                if choice == "keep":
+                    try:
+                        await query.message.edit_text(
+                            "👌 Оставляю текущую модель.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await query.message.reply_text("👌 Оставляю текущую модель.")
+                    return
+
+                # Маппинг алиасов для кнопок рекомендации
+                _recommend_aliases = {
+                    "claude": ("anthropic", "claude-sonnet-4-20250514"),
+                    "gpt": ("openai", "gpt-4o"),
+                }
+
+                if choice in _recommend_aliases:
+                    prov, mdl = _recommend_aliases[choice]
+                    selected_str = f"{prov}/{mdl}"
+                else:
+                    # Пробуем через стандартный резолвер
+                    resolved = await _resolve_and_switch_model(user.id, choice, db_service, model_catalog, ai_engine)
+                    if resolved:
+                        from services.model_catalog import get_model_meta
+                        meta = get_model_meta(choice)
+                        try:
+                            await query.message.edit_text(
+                                f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            await query.message.reply_text(
+                                f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        return
+                    else:
+                        try:
+                            await query.message.edit_text(
+                                f"⚠️ Модель <code>{choice}</code> недоступна.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            await query.message.reply_text(
+                                f"⚠️ Модель <code>{choice}</code> недоступна.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        return
+
+                # Для алиасов (claude, gpt) — сохраняем напрямую
+                try:
+                    await db_service.update_user(user.id, {"selected_model": selected_str})
+                except Exception as db_err:
+                    logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                    try:
+                        await query.message.edit_text(
+                            "⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                from services.model_catalog import get_model_meta
+                meta = get_model_meta(choice)
+                logger.info(f"Пользователь {user.id} выбрал рекомендованную модель: {selected_str}")
+                try:
+                    await query.message.edit_text(
+                        f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+            # --- Vault callbacks ---
+            elif data.startswith("vault:"):
+                if not is_authorized(user.id):
+                    return
+
+                parts = data.split(":", 2)
+                action = parts[1] if len(parts) > 1 else ""
+                param = parts[2] if len(parts) > 2 else ""
+
+                if action == "view" and param:
+                    # Показать полное содержимое элемента
+                    item = await db_service.vault_get(user.id, param)
+                    if not item:
+                        try:
+                            await query.message.edit_text("⚠️ Элемент не найден.")
+                        except Exception:
+                            await query.message.reply_text("⚠️ Элемент не найден.")
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                    title = item.get('title', 'Без названия')
+                    content = item.get('content', '')
+                    # Обрезаем контент если слишком длинный для Telegram
+                    if len(content) > 3000:
+                        content = content[:3000] + "\n\n<i>... (обрезано)</i>"
+
+                    text = (
+                        f"{emoji} <b>{html.escape(title)}</b>\n\n"
+                        f"{html.escape(content)}"
+                    )
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Удалить", callback_data=f"vault:del:{param}"),
+                            InlineKeyboardButton("« Назад", callback_data="vault:back"),
+                        ]
+                    ])
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "del" and param:
+                    # Подтверждение удаления
+                    item = await db_service.vault_get(user.id, param)
+                    title = item.get('title', 'элемент') if item else 'элемент'
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Да, удалить", callback_data=f"vault:confirm_del:{param}"),
+                            InlineKeyboardButton("« Отмена", callback_data="vault:back"),
+                        ]
+                    ])
+                    try:
+                        await query.message.edit_text(
+                            f"Удалить <b>{html.escape(title)}</b>?",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=keyboard,
+                        )
+                    except Exception:
+                        pass
+
+                elif action == "confirm_del" and param:
+                    # Удаление
+                    try:
+                        deleted = await db_service.vault_delete(user.id, param)
+                        if deleted:
+                            text = "✅ Удалено."
+                        else:
+                            text = "⚠️ Элемент уже удалён."
+                    except Exception as e:
+                        logger.error(f"Vault delete error for {user.id}: {e}")
+                        text = "⚠️ Ошибка удаления."
+                    try:
+                        await query.message.edit_text(text)
+                    except Exception:
+                        await query.message.reply_text(text)
+
+                elif action == "page" and param:
+                    # Пагинация — следующая страница
+                    try:
+                        items = await db_service.vault_list(user.id, limit=10, cursor=param)
+                    except Exception as e:
+                        logger.error(f"Vault page error: {e}")
+                        return
+
+                    if not items:
+                        try:
+                            await query.message.edit_text("📦 Больше элементов нет.")
+                        except Exception:
+                            pass
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    lines = ["📦 <b>Хранилище (продолжение)</b>\n"]
+                    buttons = []
+                    for item in items:
+                        emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                        t = item.get('title', 'Без названия')[:40]
+                        preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                        lines.append(f"{emoji} <b>{html.escape(t)}</b>\n<i>{html.escape(preview)}</i>\n")
+                        buttons.append([InlineKeyboardButton(
+                            f"{emoji} {t}",
+                            callback_data=f"vault:view:{item['id'][:20]}"
+                        )])
+
+                    if len(items) == 10:
+                        last_id = items[-1]['id']
+                        buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+                    text = "\n".join(lines)
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "back":
+                    # Назад к списку
+                    try:
+                        items = await db_service.vault_list(user.id, limit=10)
+                    except Exception:
+                        return
+
+                    if not items:
+                        try:
+                            await query.message.edit_text("📦 Хранилище пусто.")
+                        except Exception:
+                            pass
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    lines = ["📦 <b>Твоё хранилище</b>\n"]
+                    buttons = []
+                    for item in items:
+                        emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                        t = item.get('title', 'Без названия')[:40]
+                        preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                        lines.append(f"{emoji} <b>{html.escape(t)}</b>\n<i>{html.escape(preview)}</i>\n")
+                        buttons.append([InlineKeyboardButton(
+                            f"{emoji} {t}",
+                            callback_data=f"vault:view:{item['id'][:20]}"
+                        )])
+
+                    if len(items) == 10:
+                        last_id = items[-1]['id']
+                        buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+                    text = "\n".join(lines)
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "save_confirm" and param:
+                    # Подтверждение сохранения из диалога (param = doc_id уже сохранённого)
+                    try:
+                        await query.message.edit_text("✅ Сохранено в хранилище.")
+                    except Exception:
+                        pass
+
+                elif action == "save_cancel":
+                    try:
+                        await query.message.edit_text("👌 Не сохраняю.")
+                    except Exception:
+                        pass
 
         # Регистрируем обработчик callback query (inline кнопки)
         application.add_handler(CallbackQueryHandler(handle_callback))

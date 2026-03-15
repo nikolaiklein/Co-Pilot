@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import datetime, timezone
 from google.cloud import firestore
 from google.api_core.exceptions import GoogleAPICallError
 
@@ -118,8 +119,7 @@ class DatabaseService:
             logger.info(f"Сообщение для пользователя {user_id} сохранено (role: {role}).")
         except Exception as e:
             logger.error(f"Ошибка при сохранении сообщения для {user_id}: {e}")
-            # Не выбрасываем исключение, чтобы не прерывать работу бота, но логируем ошибку
-            pass
+            raise
 
     async def get_last_messages(self, user_id: int, limit: int = 10) -> list:
         """
@@ -174,8 +174,7 @@ class DatabaseService:
             logger.info(f"Пользователь {user_id} обновлен.")
         except Exception as e:
             logger.error(f"Ошибка при обновлении пользователя {user_id}: {e}")
-            # Возможно, стоит кидать исключение, если обновление критично
-            pass
+            raise
 
     async def save_report(self, user_id: int, report_data: dict):
         """
@@ -196,7 +195,7 @@ class DatabaseService:
             logger.info(f"Отчет для пользователя {user_id} сохранен.")
         except Exception as e:
             logger.error(f"Ошибка при сохранении отчета для {user_id}: {e}")
-            pass
+            raise
 
     async def clear_messages(self, user_id: int) -> int:
         """
@@ -301,3 +300,154 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Ошибка при получении списка пользователей: {e}")
             return []
+
+    # === Vault (персональное хранилище) ===
+
+    _VAULT_MAX_ITEMS = 500
+
+    async def vault_save(self, user_id: int, title: str, content: str,
+                         item_type: str = "note", tags: list[str] | None = None) -> str:
+        """
+        Сохраняет элемент в vault пользователя.
+        Ограничение: 500 элементов на пользователя.
+
+        Returns:
+            str: ID созданного документа.
+
+        Raises:
+            ValueError: если превышен лимит или невалидные данные.
+            Exception: при ошибке Firestore (EC-7).
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован.")
+
+        # Валидация
+        if not title or len(title) > 200:
+            raise ValueError("Заголовок обязателен (макс. 200 символов)")
+        if not content or len(content) > 10_000:
+            raise ValueError("Содержимое обязательно (макс. 10 000 символов)")
+        if item_type not in ("prompt", "idea", "note"):
+            raise ValueError(f"Тип '{item_type}' не поддерживается. Доступны: prompt, idea, note")
+
+        clean_tags = []
+        if tags:
+            clean_tags = [t[:50] for t in tags[:10]]
+
+        user_ref = self.db.collection('users').document(str(user_id))
+
+        # Проверяем лимит через vault_count
+        user_doc = await user_ref.get()
+        if user_doc.exists:
+            current_count = user_doc.to_dict().get('vault_count', 0)
+            if current_count >= self._VAULT_MAX_ITEMS:
+                raise ValueError(f"Превышен лимит хранилища ({self._VAULT_MAX_ITEMS} элементов)")
+
+        vault_ref = user_ref.collection('vault')
+        item_data = {
+            'title': title,
+            'content': content,
+            'type': item_type,
+            'tags': clean_tags,
+            'created_at': firestore.SERVER_TIMESTAMP,
+        }
+
+        # Сохраняем документ и инкрементируем счётчик атомарно
+        _, doc_ref = await vault_ref.add(item_data)
+        await user_ref.update({'vault_count': firestore.Increment(1)})
+
+        logger.info(f"Vault: сохранён элемент {doc_ref.id} для {user_id} (type={item_type})")
+        return doc_ref.id
+
+    async def vault_list(self, user_id: int, limit: int = 10,
+                         cursor: str | None = None,
+                         item_type: str | None = None) -> list[dict]:
+        """
+        Возвращает список элементов vault с пагинацией.
+
+        Args:
+            user_id: Telegram User ID.
+            limit: Максимум элементов (по умолчанию 10).
+            cursor: ID документа для start_after (пагинация).
+            item_type: Фильтр по типу (prompt/idea/note), None = все.
+
+        Returns:
+            list[dict]: Элементы vault с полем 'id'.
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован.")
+
+        vault_ref = self.db.collection('users').document(str(user_id)).collection('vault')
+        query = vault_ref.order_by('created_at', direction=firestore.Query.DESCENDING)
+
+        if item_type:
+            query = query.where(filter=firestore.FieldFilter('type', '==', item_type))
+
+        if cursor:
+            cursor_doc = await vault_ref.document(cursor).get()
+            if cursor_doc.exists:
+                query = query.start_after(cursor_doc)
+
+        query = query.limit(limit)
+        docs = await query.get()
+
+        items = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            # Конвертируем timestamp в строку для сериализации
+            if data.get('created_at') and hasattr(data['created_at'], 'isoformat'):
+                data['created_at'] = data['created_at'].isoformat()
+            items.append(data)
+
+        return items
+
+    async def vault_get(self, user_id: int, doc_id: str) -> dict | None:
+        """Получает один элемент vault по ID."""
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован.")
+
+        doc_ref = self.db.collection('users').document(str(user_id)).collection('vault').document(doc_id)
+        doc = await doc_ref.get()
+
+        if not doc.exists:
+            return None
+
+        data = doc.to_dict()
+        data['id'] = doc.id
+        return data
+
+    async def vault_delete(self, user_id: int, doc_id: str) -> bool:
+        """
+        Удаляет элемент vault. Декрементирует vault_count.
+
+        Returns:
+            bool: True если элемент существовал и был удалён.
+
+        Raises:
+            Exception: при ошибке Firestore (EC-7).
+        """
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован.")
+
+        user_ref = self.db.collection('users').document(str(user_id))
+        doc_ref = user_ref.collection('vault').document(doc_id)
+
+        doc = await doc_ref.get()
+        if not doc.exists:
+            return False
+
+        await doc_ref.delete()
+        await user_ref.update({'vault_count': firestore.Increment(-1)})
+
+        logger.info(f"Vault: удалён элемент {doc_id} для {user_id}")
+        return True
+
+    async def vault_count(self, user_id: int) -> int:
+        """Возвращает количество элементов в vault пользователя."""
+        if not self.db:
+            raise RuntimeError("DatabaseService не инициализирован.")
+
+        user_doc = await self.db.collection('users').document(str(user_id)).get()
+        if user_doc.exists:
+            return user_doc.to_dict().get('vault_count', 0)
+        return 0

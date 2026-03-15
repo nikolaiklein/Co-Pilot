@@ -127,7 +127,8 @@ async def lifespan(app: FastAPI):
     # 6. Telegram Bot Application
     try:
         app.state.bot_app = await create_bot_app(
-            app.state.db, app.state.ai_engine, app.state.analyzer, app.state.memory
+            app.state.db, app.state.ai_engine, app.state.analyzer, app.state.memory,
+            model_catalog=app.state.model_catalog
         )
         if app.state.bot_app:
             await app.state.bot_app.start()
@@ -190,7 +191,13 @@ async def telegram_webhook(request: Request):
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Ошибка при обработке вебхука: {e}")
-        return {"status": "error", "message": str(e)}
+        # EC-6: HTTP 500 для транзиентных ошибок — Telegram повторит запрос
+        # EC-8: Не утечка внутренних деталей в ответе
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal processing error"}
+        )
 
 
 @app.post("/cron/analyze")
