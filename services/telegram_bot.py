@@ -193,15 +193,15 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         def _build_recommendation_keyboard() -> InlineKeyboardMarkup:
             """Строит inline keyboard с популярными моделями для рекомендации."""
-            from services.model_catalog import MODEL_FAMILY_META
             buttons = [
-                [InlineKeyboardButton("✨ Gemini Flash", callback_data="mswitch:gemini-2.5-flash"),
-                 InlineKeyboardButton("✨ Gemini Pro", callback_data="mswitch:gemini-2.5-pro")],
-                [InlineKeyboardButton("🟣 Claude", callback_data="mswitch:claude"),
-                 InlineKeyboardButton("⚪ GPT-4o", callback_data="mswitch:gpt")],
-                [InlineKeyboardButton("🔵 Kimi K2", callback_data="mswitch:kimi-k2"),
-                 InlineKeyboardButton("🟠 DeepSeek", callback_data="mswitch:deepseek-v3.2")],
-                [InlineKeyboardButton("Оставить текущую", callback_data="mswitch:keep")],
+                [InlineKeyboardButton("✨ Gemini 2.5 Flash — быстрая", callback_data="mswitch:gemini-2.5-flash")],
+                [InlineKeyboardButton("✨ Gemini 2.5 Pro — мощная", callback_data="mswitch:gemini-2.5-pro")],
+                [InlineKeyboardButton("🟣 Claude Sonnet 4 — умная", callback_data="mswitch:claude")],
+                [InlineKeyboardButton("⚪ GPT-4o — универсальная", callback_data="mswitch:gpt")],
+                [InlineKeyboardButton("🔵 Kimi K2 — рассуждения", callback_data="mswitch:kimi-k2")],
+                [InlineKeyboardButton("🟠 DeepSeek V3 — код и анализ", callback_data="mswitch:deepseek-v3.2")],
+                [InlineKeyboardButton("📋 Все модели (40+) →", callback_data="mc:categories")],
+                [InlineKeyboardButton("✅ Оставить текущую", callback_data="mswitch:keep")],
             ]
             return InlineKeyboardMarkup(buttons)
 
@@ -1483,9 +1483,13 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     return
 
                 if data.startswith("mc:"):
-                    # Категория выбрана — показываем модели внутри
                     family = data[3:]
-                    text, keyboard = await _build_models_keyboard(user.id, family)
+                    if family == "categories":
+                        # Переход к полному каталогу категорий
+                        text, keyboard = await _build_categories_keyboard(user.id)
+                    else:
+                        # Категория выбрана — показываем модели внутри
+                        text, keyboard = await _build_models_keyboard(user.id, family)
                 elif data == "mback":
                     # Назад к категориям
                     text, keyboard = await _build_categories_keyboard(user.id)
