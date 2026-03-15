@@ -20,23 +20,36 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 def markdown_to_telegram_html(text: str) -> str:
     """
     Конвертирует Markdown от AI в HTML-формат Telegram.
+    Если текст уже содержит HTML-теги — сохраняет их.
     Telegram поддерживает: <b>, <i>, <code>, <pre>, <a>, <s>, <u>
     """
-    # Экранируем HTML-спецсимволы
-    text = html.escape(text)
-    
-    # Конвертируем **жирный** -> <b>жирный</b>
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    
-    # Конвертируем *курсив* -> <i>курсив</i>
-    text = re.sub(r'\*([^*]+?)\*', r'<i>\1</i>', text)
-    
-    # Конвертируем `код` -> <code>код</code>
-    text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
-    
-    # Конвертируем ~~зачёркнутый~~ -> <s>зачёркнутый</s>
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-    
+    # Проверяем, есть ли уже HTML-теги в тексте
+    _telegram_tags = re.compile(r'</?(?:b|i|u|s|code|pre|a)\b[^>]*>')
+    has_html = bool(_telegram_tags.search(text))
+
+    if has_html:
+        # Текст уже содержит HTML — сохраняем теги, экранируем только контент между ними
+        # Разбиваем на части: теги и текст между ними
+        parts = _telegram_tags.split(text)
+        tags = _telegram_tags.findall(text)
+        result = []
+        for i, part in enumerate(parts):
+            result.append(html.escape(part))
+            if i < len(tags):
+                result.append(tags[i])
+        text = ''.join(result)
+    else:
+        # Чистый markdown — конвертируем
+        text = html.escape(text)
+        # **жирный** -> <b>жирный</b>
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        # *курсив* -> <i>курсив</i>
+        text = re.sub(r'\*([^*]+?)\*', r'<i>\1</i>', text)
+        # `код` -> <code>код</code>
+        text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
+        # ~~зачёркнутый~~ -> <s>зачёркнутый</s>
+        text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+
     return text
 
 
