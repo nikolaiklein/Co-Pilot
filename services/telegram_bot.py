@@ -336,7 +336,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     model=req_model,
                     messages=messages_for_ai,
                     system_prompt=system_prompt,
-                    timeout=10.0,
+                    timeout=30.0,
                 )
 
                 # 6a. Парсим теги из ответа (Willison: separate parsing from execution)
@@ -360,14 +360,12 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                             logger.error(f"Ошибка переключения модели для {user.id}: {switch_err}")
                             response_text += "\n\n⚠️ Не удалось переключить модель."
 
-                # Добавляем footnote если провайдер сменился (ротация)
+                # Генерируем footnote если провайдер сменился (ротация)
                 rotation_footnote = format_rotation_footnote(
                     req_provider, req_model, actual_provider, actual_model
                 )
-                if rotation_footnote:
-                    response_text += rotation_footnote
 
-                # 6c. Сохраняем ЧИСТЫЙ ответ ассистента (без тегов — предотвращает context poisoning)
+                # 6c. Сохраняем ЧИСТЫЙ ответ ассистента (без тегов и сносок — предотвращает context poisoning)
                 try:
                     await db_service.save_message(user.id, "assistant", response_text)
                 except Exception as save_err:
@@ -390,8 +388,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     except Exception as analyzer_error:
                         logger.warning(f"Не удалось запустить анализ профиля: {analyzer_error}")
 
-                # 7. Форматируем и отправляем ответ
-                formatted_response = markdown_to_telegram_html(response_text)
+                # 7. Форматируем и отправляем ответ (сноска добавляется только в отправку, не в историю)
+                display_text = response_text + rotation_footnote if rotation_footnote else response_text
+                formatted_response = markdown_to_telegram_html(display_text)
 
                 # Если это рекомендация — добавляем inline keyboard для выбора модели
                 recommend_keyboard = None
