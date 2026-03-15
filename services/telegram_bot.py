@@ -319,7 +319,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 if any(kw in user_text_lower for kw in _recommend_keywords):
                     is_recommend_intent = True
 
-                system_prompt = build_system_prompt(db_user, user.first_name, model_context=model_context)
+                # Формируем строку текущей модели для промпта
+                current_model_str = f"{user_provider or ai_engine.default_provider_name}/{user_model or ai_engine.default_model}"
+                system_prompt = build_system_prompt(db_user, user.first_name, model_context=model_context, current_model=current_model_str)
                 if memory_context:
                     system_prompt = f"<instructions>\n{system_prompt}\n</instructions>\n\n<user_context>\n{memory_context}\n</user_context>"
 
@@ -785,7 +787,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     lines.append(f"  <code>/model {short_name}</code>")
                 return "\n".join(lines), None
 
-            groups = await catalog.get_models_grouped()
+            groups = await model_catalog.get_models_grouped()
             text = f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n\n🤖 <b>Выбери категорию:</b>"
 
             buttons = []

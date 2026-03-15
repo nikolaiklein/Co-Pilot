@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 # --- Системный промпт ---
 
-def build_system_prompt(user_profile: dict = None, user_name: str = None, model_context: str = None) -> str:
+def build_system_prompt(user_profile: dict = None, user_name: str = None, model_context: str = None, current_model: str = None) -> str:
     """
     Генерирует системный промпт, адаптированный под профиль пользователя.
     """
@@ -132,7 +132,12 @@ def build_system_prompt(user_profile: dict = None, user_name: str = None, model_
 - Не объясняй тег пользователю.
 """
 
-    return base_prompt + mode_hint + personal_section + model_switch_section
+    # Информация о текущей модели
+    model_info = ""
+    if current_model:
+        model_info = f"\n## Текущая активная модель\nТы работаешь на модели: {current_model}\nКогда пользователь спрашивает 'какая у тебя модель' — отвечай эту информацию.\n"
+
+    return base_prompt + mode_hint + personal_section + model_info + model_switch_section
 
 
 # --- Абстрактный провайдер ---
