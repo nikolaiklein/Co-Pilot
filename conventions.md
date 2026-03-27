@@ -77,3 +77,34 @@ These must be followed — flag violations as findings.
 **Convention:** All `analyze()` methods on all providers must log the same structured metadata as `generate()`: model identifier, token usage, latency, finish_reason. No LLM call may execute without observability.
 **Origin:** Willison — Council Review 2026-03-15-0020
 **Principle:** `references/quality-llm.md` → Principle 4
+
+### EC-15: All LLM analyze() calls must set explicit low temperature
+**Convention:** All `analyze()` calls that produce structured JSON output must set an explicit low temperature (0.1–0.2). Never rely on provider defaults for structured output generation.
+**Origin:** Willison — Council Review 2026-03-26-0738
+**Principle:** `references/quality-llm.md` → Principle 8
+
+### EC-16: Error messages to users must never contain raw exception text
+**Convention:** All error messages sent to Telegram users must use generic human-readable text, never `str(e)` or raw exception details. Log full exceptions server-side only. This extends EC-8 (which covers HTTP responses) to all Telegram user-facing messages.
+**Origin:** Hunt × Telegram UX × Friedman — Council Review 2026-03-26-0738
+**Principle:** `references/security.md` → Principle 9
+
+### EC-17: Inline keyboard callbacks must use edit_text, not reply_text
+**Convention:** All callback query handlers must use `query.message.edit_text()` with a try/except fallback to `reply_text`. Never use `reply_text` directly — it leaves stale inline keyboards clickable and creates chat noise.
+**Origin:** Telegram UX × Saarinen — Council Review 2026-03-26-0738
+**Principle:** `references/quality-frontend.md` → Principle 5
+
+### EC-18: All callback handlers must include authorization check
+**Convention:** Every `CallbackQueryHandler` must verify user authorization (via `@authorized` decorator or manual `state.is_authorized()` check) unless the callback is explicitly public (e.g., onboarding flow from /start). Unauthorized users must receive a visible alert, not silent rejection.
+**Origin:** Hunt — Council Review 2026-03-26-0738
+**Principle:** `references/security.md` → Principle 7
+
+---
+
+## Accepted Patterns
+
+These are intentional — do not flag as findings.
+
+### AP-5: Closure-capture pattern in handler modules accepted temporarily
+**Pattern:** Handler modules use `register_handlers(app, services)` which unpacks services into local variables and defines handlers as closures capturing these locals. This blocks unit testing but is functionally correct.
+**Origin:** Fowler × Beck — Council Review 2026-03-26-0738
+**Rationale:** Accepted until handler test infrastructure is built; refactoring to `context.bot_data` access pattern is planned but deferred.

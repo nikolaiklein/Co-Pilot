@@ -124,11 +124,28 @@ async def lifespan(app: FastAPI):
         app.state.model_catalog = ModelCatalog()
         app.state.litellm_available = False
 
+    # 5.6. LangGraph — compile once at startup
+    try:
+        if app.state.ai_engine:
+            from services.graph.builder import build_graph
+            app.state.graph = build_graph(
+                ai_engine=app.state.ai_engine,
+                model_catalog=app.state.model_catalog,
+            )
+            logger.info("LangGraph compiled: router → generate → END")
+        else:
+            app.state.graph = None
+            logger.warning("LangGraph не скомпилирован (нет AIEngine).")
+    except Exception as e:
+        logger.error(f"Ошибка компиляции LangGraph: {e}")
+        app.state.graph = None
+
     # 6. Telegram Bot Application
     try:
         app.state.bot_app = await create_bot_app(
             app.state.db, app.state.ai_engine, app.state.analyzer, app.state.memory,
-            model_catalog=app.state.model_catalog
+            model_catalog=app.state.model_catalog,
+            graph=app.state.graph,
         )
         if app.state.bot_app:
             await app.state.bot_app.start()
