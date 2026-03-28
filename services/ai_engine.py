@@ -703,15 +703,26 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return "[Ошибка обработки аудио]"
 
+    # Ротация бесплатных NVIDIA моделей для анализа профиля
+    ANALYZER_MODELS = [
+        "deepseek-ai/deepseek-v3.2",
+        "minimaxai/minimax-m2.5",
+        "moonshotai/kimi-k2-instruct",
+    ]
+
     async def analyze_content(self, prompt: str) -> str:
-        """Анализирует контент через дефолтный провайдер (Gemini). Не зависит от выбора пользователя."""
-        try:
-            # Всегда используем дефолтный провайдер — анализатор заточен под Gemini
-            provider = self.get_provider(self.default_provider_name, self.default_model)
-            return await provider.analyze(prompt)
-        except Exception as e:
-            logger.error(f"Ошибка при анализе контента: {e}")
-            return f"[Ошибка анализа]"
+        """Анализирует контент через бесплатные NVIDIA NIM модели с ротацией. Не зависит от выбора пользователя."""
+        for model in self.ANALYZER_MODELS:
+            try:
+                provider = self.get_provider("nvidia", model)
+                result = await provider.analyze(prompt)
+                logger.info(f"Анализ профиля выполнен через {model}")
+                return result
+            except Exception as e:
+                logger.warning(f"Анализ через {model} не удался: {e}")
+                continue
+        logger.error("Все NVIDIA модели для анализа недоступны")
+        return "[Ошибка анализа]"
 
     async def analyze_image(
         self,
