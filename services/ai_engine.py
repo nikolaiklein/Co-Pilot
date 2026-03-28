@@ -630,7 +630,7 @@ class AIEngine:
         self.default_model: str = ""
 
         # Парсим DEFAULT_MODEL из env
-        default = os.getenv("DEFAULT_MODEL", "gemini/gemini-2.5-flash")
+        default = os.getenv("DEFAULT_MODEL", "nvidia/mistralai/mistral-large-3-675b-instruct-2512")
         provider_name, model = parse_model_string(default)
 
         try:
@@ -703,11 +703,11 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return "[Ошибка обработки аудио]"
 
-    # Ротация бесплатных NVIDIA моделей для анализа профиля
+    # Ротация бесплатных NVIDIA моделей для анализа профиля (дешёвые/быстрые первыми)
     ANALYZER_MODELS = [
         "deepseek-ai/deepseek-v3.2",
-        "minimaxai/minimax-m2.5",
         "moonshotai/kimi-k2-instruct",
+        "meta/llama-4-maverick-17b-128e-instruct",
     ]
 
     async def analyze_content(self, prompt: str) -> str:

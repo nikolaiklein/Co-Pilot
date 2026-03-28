@@ -44,26 +44,17 @@ async def generate_with_fallback(
     Returns:
         (response_text, actual_provider, actual_model)
     """
-    from services.model_catalog import MODEL_FAMILY_META, get_model_meta
+    from services.model_catalog import NVIDIA_FALLBACK_CHAIN
 
-    # Строим fallback chain: (1) retry same, (2) same family, (3) default Gemini
+    # Строим fallback chain: запрошенная модель + остальные NVIDIA по мощности
     fallback_chain = [(provider_name, model)]
+    for nvidia_model in NVIDIA_FALLBACK_CHAIN:
+        pair = ("nvidia", nvidia_model)
+        if pair not in fallback_chain:
+            fallback_chain.append(pair)
 
-    # Получаем family_fallback_order для текущей модели
-    meta = get_model_meta(model)
-    family_fallbacks = meta.get("family_fallback_order", [])
-    for fb_model in family_fallbacks:
-        if fb_model != model:
-            fallback_chain.append((provider_name, fb_model))
-
-    # Финальный fallback — дефолтный Gemini
-    if ai_engine.default_provider_name and ai_engine.default_model:
-        default_pair = (ai_engine.default_provider_name, ai_engine.default_model)
-        if default_pair not in fallback_chain:
-            fallback_chain.append(default_pair)
-
-    # Максимум 3 попытки
-    fallback_chain = fallback_chain[:3]
+    # Максимум 4 попытки
+    fallback_chain = fallback_chain[:4]
 
     last_error = None
     for attempt, (prov, mdl) in enumerate(fallback_chain, 1):

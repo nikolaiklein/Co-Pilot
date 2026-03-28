@@ -157,15 +157,21 @@ FILTER_PATTERNS = [
 
 # Модели доступные через NVIDIA NIM (проверенные, рабочие)
 NVIDIA_MODELS = {
-    "llama-4-maverick": "meta/llama-4-maverick-17b-128e-instruct",
-    "kimi-k2": "moonshotai/kimi-k2-instruct",
-    "kimi-k2.5": "moonshotai/kimi-k2.5",
-    "deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
-    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
-    "nemotron-ultra": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
     "mistral-large-3": "mistralai/mistral-large-3-675b-instruct-2512",
-    "minimax-m2.5": "minimaxai/minimax-m2.5",
+    "qwen3.5-397b": "qwen/qwen3.5-397b-a17b",
+    "deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
+    "kimi-k2": "moonshotai/kimi-k2-instruct",
+    "llama-4-maverick": "meta/llama-4-maverick-17b-128e-instruct",
 }
+
+# Порядок ротации NVIDIA моделей (от мощных к быстрым)
+NVIDIA_FALLBACK_CHAIN = [
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "qwen/qwen3.5-397b-a17b",
+    "deepseek-ai/deepseek-v3.2",
+    "moonshotai/kimi-k2-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+]
 
 # Доступные Gemini модели (проверенные, рабочие)
 GEMINI_MODELS = {
@@ -180,10 +186,10 @@ GEMINI_MODELS = {
 }
 
 DEFAULT_MODELS = {
+    "nvidia": "mistralai/mistral-large-3-675b-instruct-2512",
     "gemini": "gemini-3-flash-preview",
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
-    "nvidia": "meta/llama-4-maverick-17b-128e-instruct",
     "litellm": "gemini-2.5-flash",
 }
 
