@@ -32,22 +32,12 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
 
-      - name: Build Docker image
+      - name: Build and push Docker image
         run: |
           IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/co-pilot/${{ env.SERVICE_NAME }}:${{ github.sha }}"
           docker build -t "$IMAGE" .
+          docker push "$IMAGE"
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-
-      - name: Smoke test — verify imports
-        run: |
-          docker run --rm "${{ env.IMAGE }}" python -c "
-          from main import app; print('Import OK');
-          from langgraph.graph import StateGraph; print('LangGraph OK');
-          from services.graph.state import GraphState; print('Graph State OK')
-          "
-
-      - name: Push Docker image
-        run: docker push "${{ env.IMAGE }}"
 
       - name: Deploy to Cloud Run
         run: |

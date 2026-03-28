@@ -1,43 +1,124 @@
-"""
-Тонкий оркестратор Telegram-бота.
-Создаёт Application, собирает services dict, регистрирует хендлеры из модулей.
-"""
-
 import os
 import logging
-
-from telegram import Update
-from telegram.ext import Application, ContextTypes
-
+import io
+import re
+import csv
+import json
+import html
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from services.db import DatabaseService
-from services.state import BotState
-from services.dialog_pipeline import DialogPipeline
 
-# Реэкспорт утилит форматирования для обратной совместимости
-# (используется в services/dialog_pipeline.py)
-from services.formatting import markdown_to_telegram_html, split_message  # noqa: F401
-
+# Настройка логирования
 logger = logging.getLogger(__name__)
 
+# Лимит символов в одном сообщении Telegram
+TELEGRAM_MESSAGE_LIMIT = 4096
 
-async def create_bot_app(
-    db_service: DatabaseService,
-    ai_engine,
-    analyzer_service=None,
-    memory_service=None,
-    model_catalog=None,
-    graph=None,
-) -> Application:
+
+def markdown_to_telegram_html(text: str) -> str:
     """
-    Создаёт и настраивает приложение Telegram-бота.
-    Регистрирует обработчики из handler-модулей.
+    Конвертирует Markdown от AI в HTML-формат Telegram.
+    Если текст уже содержит HTML-теги — сохраняет их.
+    Telegram поддерживает: <b>, <i>, <code>, <pre>, <a>, <s>, <u>
+    """
+    # Проверяем, есть ли уже HTML-теги в тексте
+    _telegram_tags = re.compile(r'</?(?:b|i|u|s|code|pre|a)\b[^>]*>')
+    has_html = bool(_telegram_tags.search(text))
+
+    if has_html:
+        # Текст уже содержит HTML — сохраняем теги, экранируем только контент между ними
+        # Разбиваем на части: теги и текст между ними
+        parts = _telegram_tags.split(text)
+        tags = _telegram_tags.findall(text)
+        result = []
+        for i, part in enumerate(parts):
+            result.append(html.escape(part))
+            if i < len(tags):
+                result.append(tags[i])
+        text = ''.join(result)
+    else:
+        # Чистый markdown — конвертируем
+        text = html.escape(text)
+        # **жирный** -> <b>жирный</b>
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        # *курсив* -> <i>курсив</i>
+        text = re.sub(r'\*([^*]+?)\*', r'<i>\1</i>', text)
+        # `код` -> <code>код</code>
+        text = re.sub(r'`([^`]+?)`', r'<code>\1</code>', text)
+        # ~~зачёркнутый~~ -> <s>зачёркнутый</s>
+        text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+
+    return text
+
+
+def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list:
+    """
+    Разбивает длинное сообщение на части, не превышающие лимит.
+    Старается разбивать по абзацам или предложениям.
+    """
+    if len(text) <= limit:
+        return [text]
+    
+    parts = []
+    current_part = ""
+    
+    # Разбиваем по абзацам
+    paragraphs = text.split('\n\n')
+    
+    for paragraph in paragraphs:
+        # Если абзац сам по себе слишком длинный
+        if len(paragraph) > limit:
+            # Сохраняем текущую часть если есть
+            if current_part:
+                parts.append(current_part.strip())
+                current_part = ""
+            
+            # Разбиваем длинный абзац по предложениям
+            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+            for sentence in sentences:
+                if len(current_part) + len(sentence) + 1 <= limit:
+                    current_part += sentence + " "
+                else:
+                    if current_part:
+                        parts.append(current_part.strip())
+                    current_part = sentence + " "
+        elif len(current_part) + len(paragraph) + 2 <= limit:
+            current_part += paragraph + "\n\n"
+        else:
+            parts.append(current_part.strip())
+            current_part = paragraph + "\n\n"
+    
+    if current_part.strip():
+        parts.append(current_part.strip())
+    
+    return parts if parts else [text[:limit]]
+
+# Мы не можем использовать аннотацию типа AIEngine здесь из-за циклического импорта,
+# если бы ai_engine импортировал telegram_bot, но здесь это безопасно.
+# Однако, для чистоты, будем использовать Any или просто duck typing.
+# from services.ai_engine import AIEngine
+
+async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_service=None, memory_service=None, model_catalog=None) -> Application:
+    """
+    Создает и настраивает приложение Telegram бота.
+    Регистрирует обработчики сообщений.
+
+    Args:
+        db_service (DatabaseService): Инициализированный сервис базы данных.
+        ai_engine (AIEngine): Инициализированный сервис ИИ.
+        analyzer_service: Сервис анализа профиля (опционально).
+
+    Returns:
+        Application: Настроенное приложение python-telegram-bot.
     """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.warning("TELEGRAM_BOT_TOKEN не найден в переменных окружения.")
         return None
 
-    # 1. Список разрешённых пользователей (Firestore -> fallback на env var)
+    # Список разрешённых пользователей (Firestore → fallback на env var)
     allowed_users = set()
     firestore_users = await db_service.get_allowed_users() if db_service else None
     if firestore_users is not None:
@@ -47,6 +128,7 @@ async def create_bot_app(
         allowed_users_str = os.getenv("ALLOWED_USERS", "")
         if allowed_users_str.strip():
             allowed_users = {int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()}
+            # Первичная миграция: сохраняем env var в Firestore
             if db_service and allowed_users:
                 await db_service.save_allowed_users(allowed_users)
                 logger.info(f"Мигрировали ALLOWED_USERS из env в Firestore: {allowed_users}")
@@ -54,42 +136,1796 @@ async def create_bot_app(
             logger.info(f"Авторизация из env. Разрешённые пользователи: {allowed_users}")
 
     try:
-        # 2. Создаём Application
-        application = Application.builder().token(token).build()
+        # Создаем билдер приложения
+        builder = Application.builder().token(token)
+        application = builder.build()
 
-        # 3. Создаём BotState и DialogPipeline
-        state = BotState(allowed_users)
-        pipeline = DialogPipeline(db_service, ai_engine, memory_service, analyzer_service, model_catalog, graph=graph)
+        def is_authorized(user_id: int) -> bool:
+            """Проверяет, авторизован ли пользователь."""
+            if not allowed_users:
+                return True
+            return user_id in allowed_users
 
-        # 4. Сохраняем в bot_data
-        application.bot_data["state"] = state
+        # Множество пользователей в режиме bulk-загрузки
+        bulk_mode_users: dict[int, int] = {}  # user_id -> count загруженных записей
 
-        # 5. Собираем services dict
-        services = {
-            "db": db_service,
-            "ai": ai_engine,
-            "memory": memory_service,
-            "analyzer": analyzer_service,
-            "catalog": model_catalog,
-            "pipeline": pipeline,
-            "state": state,
-            "allowed_users": allowed_users,
-        }
+        def _build_model_context_for_prompt(catalog) -> str | None:
+            """Строит компактный блок доступных моделей для system prompt (Willison: curate, не dump)."""
+            from services.model_catalog import MODEL_FAMILY_META, NVIDIA_MODELS, GEMINI_MODELS
+            lines = []
+            # Короткие имена из GEMINI_MODELS и NVIDIA_MODELS
+            for short_name in GEMINI_MODELS:
+                lines.append(f"- {short_name} (Gemini)")
+            for short_name in NVIDIA_MODELS:
+                family = "NVIDIA"
+                for prefix, meta in MODEL_FAMILY_META.items():
+                    if short_name.startswith(prefix):
+                        family = meta.get("label", "NVIDIA")
+                        break
+                lines.append(f"- {short_name} ({family})")
+            # Прямые провайдеры
+            lines.append("- claude (Claude)")
+            lines.append("- gpt (OpenAI GPT)")
+            return "\n".join(lines) if lines else None
 
-        # 6. Регистрируем хендлеры из модулей
-        from handlers import commands, model_commands, vault_commands, admin, media, dialog
+        async def _resolve_and_switch_model(user_id: int, model_id: str, db_svc, catalog, engine) -> str | None:
+            """
+            Резолвит model_id и сохраняет в Firestore. Возвращает resolved model string или None.
+            """
+            from services.ai_engine import parse_model_string
+            from services.model_catalog import NVIDIA_MODELS, GEMINI_MODELS
 
-        commands.register_handlers(application, services)
-        model_commands.register_handlers(application, services)
-        vault_commands.register_handlers(application, services)
-        admin.register_handlers(application, services)
-        media.register_handlers(application, services)
-        dialog.register_handlers(application, services)
+            # Пробуем как короткое имя Gemini/NVIDIA
+            if model_id in GEMINI_MODELS:
+                selected = f"gemini/{GEMINI_MODELS[model_id]}"
+                await db_svc.update_user(user_id, {"selected_model": selected})
+                return model_id
+            if model_id in NVIDIA_MODELS:
+                selected = f"nvidia/{NVIDIA_MODELS[model_id]}"
+                await db_svc.update_user(user_id, {"selected_model": selected})
+                return model_id
 
-        # 7. Глобальный обработчик ошибок
+            # Пробуем через parse_model_string
+            provider, model = parse_model_string(model_id)
+            if provider and model:
+                # Валидация: проверяем в каталоге LiteLLM
+                if catalog and catalog.is_available:
+                    models = await catalog.get_models()
+                    if model_id in models:
+                        await db_svc.update_user(user_id, {"selected_model": f"litellm/{model_id}"})
+                        return model_id
+                # Пробуем через провайдер
+                try:
+                    engine.get_provider(provider, model)
+                    await db_svc.update_user(user_id, {"selected_model": f"{provider}/{model}"})
+                    return model_id
+                except ValueError:
+                    pass
+
+            return None
+
+        def _build_recommendation_keyboard() -> InlineKeyboardMarkup:
+            """Строит inline keyboard с популярными моделями — только доступные."""
+            import os
+            # Список популярных моделей с проверкой доступности
+            _popular = [
+                ("✨ Gemini 2.5 Flash — быстрая", "mswitch:gemini-2.5-flash", "GEMINI_API_KEY"),
+                ("✨ Gemini 2.5 Pro — мощная", "mswitch:gemini-2.5-pro", "GEMINI_API_KEY"),
+                ("🟣 Claude Sonnet 4 — умная", "mswitch:claude", "ANTHROPIC_API_KEY"),
+                ("⚪ GPT-4o — универсальная", "mswitch:gpt", "OPENAI_API_KEY"),
+                ("🔵 Kimi K2 — рассуждения", "mswitch:kimi-k2", "NVIDIA_API_KEY"),
+                ("🟠 DeepSeek V3 — код и анализ", "mswitch:deepseek-v3.2", "NVIDIA_API_KEY"),
+            ]
+            buttons = []
+            for label, callback, env_key in _popular:
+                if os.getenv(env_key):
+                    buttons.append([InlineKeyboardButton(label, callback_data=callback)])
+
+            buttons.append([InlineKeyboardButton("📋 Все модели →", callback_data="mc:categories")])
+            buttons.append([InlineKeyboardButton("✅ Оставить текущую", callback_data="mswitch:keep")])
+            return InlineKeyboardMarkup(buttons)
+
+        # Общая функция для обработки логики диалога (используется для текста и голоса)
+        async def process_dialog_turn(user, chat_id, user_text, context):
+            try:
+                # 0. Режим bulk-загрузки: сохраняем в память (сырой текст + факты)
+                if user.id in bulk_mode_users:
+                    if memory_service:
+                        import asyncio
+                        await memory_service.store_bulk(user.id, user_text)
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
+                        count = bulk_mode_users[user.id]
+                        # Отвечаем кратко каждые 5 сообщений, иначе тихо
+                        if count % 5 == 0:
+                            await context.bot.send_message(chat_id=chat_id, text=f"✅ Загружено: {count}")
+                        else:
+                            await context.bot.send_message(chat_id=chat_id, text="✅")
+                    else:
+                        await context.bot.send_message(chat_id=chat_id, text="❌ Memory Service не доступен.")
+                    return
+
+                # 0.5. Быстрое сохранение в vault: "Запиши идею: текст"
+                vault_match = _vault_save_patterns.match(user_text.strip())
+                if vault_match:
+                    content = vault_match.group(1).strip()
+                    if content:
+                        # Определяем тип по ключевому слову
+                        lower = user_text.lower()
+                        if "промпт" in lower:
+                            item_type = "prompt"
+                        elif "идею" in lower or "идея" in lower:
+                            item_type = "idea"
+                        else:
+                            item_type = "note"
+                        title = content[:60] + ("..." if len(content) > 60 else "")
+                        try:
+                            await db_service.vault_save(user.id, title, content, item_type=item_type)
+                            type_label = {"prompt": "Промпт", "idea": "Идея", "note": "Заметка"}
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ {type_label[item_type]} сохранена в хранилище: <b>{html.escape(title)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except ValueError as e:
+                            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {e}")
+                        except Exception as e:
+                            logger.error(f"Vault quick-save error for {user.id}: {e}")
+                            await context.bot.send_message(chat_id=chat_id, text="⚠️ Не удалось сохранить.")
+                        return
+
+                # 1. Получаем или создаем пользователя в БД
+                user_data = {
+                    "id": user.id,
+                    "username": user.username,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "language_code": user.language_code,
+                    "is_bot": user.is_bot
+                }
+                db_user = await db_service.get_or_create_user(user.id, user_data)
+
+                # 2. Сохраняем сообщение пользователя
+                try:
+                    await db_service.save_message(user.id, "user", user_text)
+                except Exception as save_err:
+                    logger.warning(f"Не удалось сохранить сообщение пользователя {user.id}: {save_err}")
+
+                # 3. Отправляем действие "печатает" (typing)
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+                # 4. Получаем историю
+                history = await db_service.get_last_messages(user.id, limit=20)
+
+                # Исключаем текущее сообщение из истории, если оно там уже есть
+                if history and history[-1]['content'] == user_text and history[-1]['role'] == 'user':
+                     history_for_ai = history[:-1]
+                else:
+                     history_for_ai = history
+
+                # 5. Определяем провайдер пользователя (сохранённый в БД)
+                from services.ai_engine import parse_model_string
+                user_provider = None
+                user_model = None
+                user_model_str = db_user.get('selected_model') if db_user else None
+                if user_model_str:
+                    user_provider, user_model = parse_model_string(user_model_str)
+
+                # 5.1. Долговременная память: поиск релевантного контекста
+                memory_context = ""
+                if memory_service:
+                    try:
+                        memory_context = await memory_service.get_memory_context(user.id, user_text)
+                    except Exception as mem_err:
+                        logger.warning(f"Memory search error: {mem_err}")
+
+                # 6. Генерируем ответ с авто-ротацией
+                from services.ai_engine import build_system_prompt
+                from services.model_rotation import generate_with_fallback, format_rotation_footnote
+                from services.response_tags import parse_response_tags
+
+                # Детектируем intent на модель — inject model_context
+                model_context = None
+                is_recommend_intent = False
+                _switch_keywords = [
+                    "переключи", "смени модель", "поставь модель", "switch",
+                ]
+                _recommend_keywords = [
+                    "подбери модель", "модель лучше", "рекомендуй модель",
+                    "посоветуй модель", "предложи модель",
+                ]
+                # "какая модель" — это вопрос о текущей, не рекомендация
+                _info_keywords = [
+                    "какая модель", "какую модель", "какая у тебя модель",
+                    "на какой модели", "текущая модель",
+                ]
+                user_text_lower = user_text.lower()
+                if any(kw in user_text_lower for kw in _switch_keywords + _recommend_keywords + _info_keywords):
+                    model_context = _build_model_context_for_prompt(model_catalog)
+                if any(kw in user_text_lower for kw in _recommend_keywords):
+                    is_recommend_intent = True
+
+                # Формируем строку текущей модели для промпта
+                current_model_str = f"{user_provider or ai_engine.default_provider_name}/{user_model or ai_engine.default_model}"
+                system_prompt = build_system_prompt(db_user, user.first_name, model_context=model_context, current_model=current_model_str)
+                if memory_context:
+                    system_prompt = f"<instructions>\n{system_prompt}\n</instructions>\n\n<user_context>\n{memory_context}\n</user_context>"
+
+                req_provider = user_provider or ai_engine.default_provider_name
+                req_model = user_model or ai_engine.default_model
+                messages_for_ai = list(history_for_ai) + [{"role": "user", "content": user_text}]
+
+                response_text, actual_provider, actual_model = await generate_with_fallback(
+                    ai_engine=ai_engine,
+                    model_catalog=model_catalog,
+                    provider_name=req_provider,
+                    model=req_model,
+                    messages=messages_for_ai,
+                    system_prompt=system_prompt,
+                    timeout=30.0,
+                )
+
+                # 6a. Парсим теги из ответа (Willison: separate parsing from execution)
+                tag_result = parse_response_tags(response_text, model_catalog)
+                response_text = tag_result.clean_text  # Чистый текст без тегов
+
+                # 6b. Выполняем действия из тегов
+                for action in tag_result.actions:
+                    if action.type == "switch_model":
+                        try:
+                            resolved = await _resolve_and_switch_model(
+                                user.id, action.model_id, db_service, model_catalog, ai_engine
+                            )
+                            if resolved:
+                                from services.model_catalog import MODEL_HINTS
+                                display_name = MODEL_HINTS.get(resolved, resolved)
+                                response_text += f"\n\n✅ Модель переключена: {display_name}"
+                            else:
+                                response_text += f"\n\n⚠️ Модель {action.model_id} сейчас недоступна, оставляю текущую."
+                        except Exception as switch_err:
+                            logger.error(f"Ошибка переключения модели для {user.id}: {switch_err}")
+                            response_text += "\n\n⚠️ Не удалось переключить модель."
+
+                    elif action.type == "vault_save":
+                        try:
+                            await db_service.vault_save(
+                                user.id,
+                                action.vault_title,
+                                action.vault_content,
+                                item_type=action.vault_type,
+                            )
+                            type_label = {"prompt": "Промпт", "idea": "Идея", "note": "Заметка"}
+                            response_text += f"\n\n✅ {type_label.get(action.vault_type, 'Заметка')} сохранена в /vault"
+                        except Exception as vault_err:
+                            logger.error(f"Vault save via tag error for {user.id}: {vault_err}")
+                            response_text += "\n\n⚠️ Не удалось сохранить в хранилище."
+
+                # Генерируем footnote если провайдер сменился (ротация)
+                rotation_footnote = format_rotation_footnote(
+                    req_provider, req_model, actual_provider, actual_model
+                )
+
+                # 6c. Сохраняем ЧИСТЫЙ ответ ассистента (без тегов и сносок — предотвращает context poisoning)
+                try:
+                    await db_service.save_message(user.id, "assistant", response_text)
+                except Exception as save_err:
+                    logger.warning(f"Не удалось сохранить ответ ассистента для {user.id}: {save_err}")
+
+                # 6.1 Сохраняем в долговременную память (фоново, Mem0 извлекает факты)
+                if memory_service:
+                    await memory_service.store_conversation(user.id, user_text, response_text)
+
+                # 6.2 Запускаем анализ профиля после каждых 3 сообщений пользователя
+                if analyzer_service:
+                    try:
+                        # Считаем сообщения пользователя в истории
+                        user_messages_count = len([m for m in history if m.get('role') == 'user'])
+                        if user_messages_count > 0 and user_messages_count % 3 == 0:
+                            logger.info(f"Запускаем анализ профиля для {user.id} (после {user_messages_count} сообщений)")
+                            # Запускаем в фоне, не ждём результата
+                            import asyncio
+                            asyncio.create_task(analyzer_service.analyze_user_profile(user.id))
+                    except Exception as analyzer_error:
+                        logger.warning(f"Не удалось запустить анализ профиля: {analyzer_error}")
+
+                # 7. Форматируем и отправляем ответ (сноска добавляется только в отправку, не в историю)
+                display_text = response_text + rotation_footnote if rotation_footnote else response_text
+                formatted_response = markdown_to_telegram_html(display_text)
+
+                # Если это рекомендация — добавляем inline keyboard для выбора модели
+                recommend_keyboard = None
+                if is_recommend_intent and not tag_result.actions:
+                    recommend_keyboard = _build_recommendation_keyboard()
+
+                message_parts = split_message(formatted_response)
+
+                for i, part in enumerate(message_parts):
+                    # Клавиатуру добавляем только к последней части
+                    reply_markup = recommend_keyboard if (i == len(message_parts) - 1 and recommend_keyboard) else None
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=part,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=reply_markup,
+                        )
+                    except Exception as send_error:
+                        # Если не удалось отправить с HTML, отправляем без форматирования
+                        logger.warning(f"Ошибка отправки с HTML: {send_error}, отправляем без форматирования")
+                        await context.bot.send_message(chat_id=chat_id, text=response_text[:4096])
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке диалога с {user.id}: {e}")
+                await context.bot.send_message(chat_id=chat_id, text="Произошла ошибка при обработке вашего сообщения.")
+
+        async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает входящие текстовые сообщения.
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            message_text = update.message.text
+            if not message_text:
+                return
+
+            logger.info(f"Получено текстовое сообщение от {user.id}")
+            await process_dialog_turn(user, update.effective_chat.id, message_text, context)
+
+        async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает входящие голосовые сообщения.
+            """
+            user = update.effective_user
+            voice = update.message.voice
+
+            if not voice:
+                return
+
+            logger.info(f"Получено голосовое сообщение от {user.id}")
+
+            try:
+                # Уведомляем пользователя, что слушаем
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_voice")
+
+                # Получаем файл
+                voice_file = await context.bot.get_file(voice.file_id)
+
+                # Скачиваем файл в память (byte array)
+                # python-telegram-bot поддерживает download_to_memory
+                # Создаем буфер
+                with io.BytesIO() as buffer:
+                    await voice_file.download_to_memory(out=buffer)
+                    buffer.seek(0)
+                    file_bytes = buffer.read()
+
+                # Транскрибируем аудио
+                transcribed_text = await ai_engine.transcribe_audio(file_bytes)
+                logger.info(f"Транскрипция для {user.id}: {transcribed_text}")
+
+                # Формируем текст сообщения с пометкой
+                user_text = f"[Голосовое сообщение]: {transcribed_text}"
+
+                # Запускаем стандартный диалоговый пайплайн
+                await process_dialog_turn(user, update.effective_chat.id, user_text, context)
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке голосового сообщения от {user.id}: {e}")
+                await update.message.reply_text("Не удалось обработать голосовое сообщение.")
+
+        async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /start.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /start от {user.id}")
+            
+            # Создаем или получаем пользователя
+            user_data = {
+                "id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "language_code": user.language_code,
+                "is_bot": user.is_bot
+            }
+            existing_user = await db_service.get_or_create_user(user.id, user_data)
+            
+            # Проверяем, есть ли уже профиль (повторный /start)
+            has_profile = existing_user and existing_user.get('profile_summary')
+            
+            if has_profile:
+                # Пользователь уже общался — приветствуем с кнопками
+                bot_name = existing_user.get('bot_nickname', 'Правильный Помощник')
+                welcome_message = f"С возвращением, {user.first_name}! 👋\n\nЯ {bot_name}, готов продолжить работу."
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📋 Мой профиль", callback_data="cmd_myprofile"),
+                        InlineKeyboardButton("💬 Продолжить", callback_data="cmd_continue")
+                    ],
+                    [
+                        InlineKeyboardButton("❓ Помощь", callback_data="cmd_help"),
+                        InlineKeyboardButton("⚙️ Дать имя", callback_data="cmd_name_hint")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+            else:
+                # Новый пользователь — онбординг с кнопками
+                welcome_message = f"""Привет, {user.first_name}! 👋
+
+Я подключен к нейросети нового поколения. Прямо сейчас я — чистый лист.
+
+Чтобы стать твоим идеальным ассистентом, мне нужно узнать тебя. С чего начнём?"""
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("🎤 Интервью", callback_data="start_interview"),
+                        InlineKeyboardButton("💬 Свободный диалог", callback_data="start_freeform")
+                    ],
+                    [
+                        InlineKeyboardButton("❓ Что ты умеешь?", callback_data="cmd_help")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(welcome_message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+        # Регистрируем обработчик команды /start
+        application.add_handler(CommandHandler("start", handle_start))
+
+        async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /help.
+            """
+            help_text = """📚 <b>Список команд:</b>
+
+/start — начать работу с ботом
+/help — показать это сообщение
+/myprofile — посмотреть моё досье (навыки, интересы, мечты)
+/model — переключить AI-модель (Gemini, Claude, GPT, NVIDIA, MiniMax)
+/vault — персональное хранилище (промпты, идеи, заметки)
+/memory — статистика и поиск по долговременной памяти
+/bulk — режим массовой загрузки данных (текст, файлы)
+/name — дать мне имя (например: /name Макс)
+/correct — исправить ошибку в профиле
+/clear — очистить историю диалога
+
+💬 Просто напишите мне сообщение, и я постараюсь помочь!
+🎤 Также вы можете отправить голосовое сообщение."""
+            await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+        # Регистрируем обработчик команды /help
+        application.add_handler(CommandHandler("help", handle_help))
+
+        async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /name — позволяет дать боту имя.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /name от {user.id}")
+            
+            # Получаем имя из аргументов команды
+            args = context.args
+            
+            if not args:
+                await update.message.reply_text(
+                    "💡 Чтобы дать мне имя, напиши:\n<code>/name Твоё_имя_для_меня</code>\n\nНапример: /name Макс",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            new_name = " ".join(args).strip()
+            
+            if len(new_name) > 50:
+                await update.message.reply_text("❌ Слишком длинное имя. Максимум 50 символов.")
+                return
+            
+            try:
+                # Сохраняем имя бота в профиль пользователя
+                await db_service.update_user(user.id, {"bot_nickname": new_name})
+                
+                await update.message.reply_text(
+                    f"✅ Отлично! Теперь я буду откликаться на имя <b>{new_name}</b>.\n\n"
+                    f"Приятно познакомиться, {user.first_name}! 🤝",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Ошибка сохранения имени бота для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось сохранить имя. Попробуй ещё раз.")
+
+        # Регистрируем обработчик команды /name
+        application.add_handler(CommandHandler("name", handle_name))
+
+        # Регистрируем обработчик команды /help
+        application.add_handler(CommandHandler("help", handle_help))
+
+        async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /clear — очищает историю диалога.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /clear от {user.id}")
+            
+            try:
+                count = await db_service.clear_messages(user.id)
+                await update.message.reply_text(f"✅ История очищена! Удалено сообщений: {count}")
+            except Exception as e:
+                logger.error(f"Ошибка очистки истории для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось очистить историю.")
+
+        # Регистрируем обработчик команды /clear
+        application.add_handler(CommandHandler("clear", handle_clear))
+
+        async def handle_myprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /myprofile — показывает накопленное досье.
+            """
+            user = update.effective_user
+            logger.info(f"Команда /myprofile от {user.id}")
+            
+            try:
+                user_data = await db_service.get_user(user.id)
+                
+                if not user_data or 'profile_summary' not in user_data:
+                    await update.message.reply_text(
+                        "📋 <b>Профиль пока пуст</b>\n\n"
+                        "Пообщайся со мной, и я постепенно соберу информацию о твоих навыках, "
+                        "интересах и целях!",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
+                profile = user_data['profile_summary']
+                
+                # Форматируем профиль
+                text = "📋 <b>Твой профиль Co-Pilot</b>\n\n"
+                
+                if isinstance(profile, dict):
+                    if profile.get('summary'):
+                        text += f"📝 <b>Портрет:</b>\n{profile['summary']}\n\n"
+
+                    if profile.get('new_skills'):
+                        text += "🛠 <b>Навыки:</b>\n"
+                        for skill in profile['new_skills']:
+                            text += f"  • {skill}\n"
+                        text += "\n"
+                    
+                    if profile.get('interests'):
+                        text += "🎯 <b>Интересы:</b>\n"
+                        for interest in profile['interests']:
+                            text += f"  • {interest}\n"
+                        text += "\n"
+                    
+                    if profile.get('pain_points'):
+                        text += "⚠️ <b>Точки роста:</b>\n"
+                        for pain in profile['pain_points']:
+                            text += f"  • {pain}\n"
+                        text += "\n"
+                    
+                    if profile.get('dreams'):
+                        text += "💭 <b>Мечты и идеи:</b>\n"
+                        for dream in profile['dreams']:
+                            text += f"  • {dream}\n"
+                        text += "\n"
+                else:
+                    text += str(profile)
+                
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                
+            except Exception as e:
+                logger.error(f"Ошибка получения профиля для {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось загрузить профиль.")
+
+        # Регистрируем обработчик команды /myprofile
+        application.add_handler(CommandHandler("myprofile", handle_myprofile))
+
+        async def handle_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /correct — исправляет ошибки в профиле.
+            Пример: /correct убери что я не люблю Python
+            """
+            user = update.effective_user
+            logger.info(f"Команда /correct от {user.id}")
+            
+            args = context.args
+            
+            if not args:
+                await update.message.reply_text(
+                    "✏️ <b>Исправление профиля</b>\n\n"
+                    "Напиши что нужно исправить:\n"
+                    "<code>/correct убери что я не люблю Python</code>\n"
+                    "<code>/correct добавь что я увлекаюсь шахматами</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            correction_request = " ".join(args).strip()
+            
+            try:
+                # Получаем текущий профиль
+                user_data = await db_service.get_user(user.id)
+                current_profile = user_data.get('profile_summary', {}) if user_data else {}
+                
+                # Формируем промпт для ИИ на исправление
+                correction_prompt = f"""
+Текущий профиль пользователя:
+{current_profile}
+
+Запрос на исправление: "{correction_request}"
+
+Задача: Внеси исправление в профиль согласно запросу пользователя.
+Верни исправленный JSON профиля в формате:
+{{
+  "new_skills": [...],
+  "interests": [...],
+  "pain_points": [...],
+  "dreams": [...],
+  "summary": "..."
+}}
+
+Если нужно удалить элемент — убери его из списка.
+Если нужно добавить — добавь.
+Ответ должен содержать только JSON без markdown.
+"""
+                
+                # Отправляем запрос к ИИ
+                corrected_json = await ai_engine.analyze_content(correction_prompt)
+                
+                # Парсим и сохраняем
+                import json
+                corrected_json = corrected_json.replace("```json", "").replace("```", "").strip()
+                
+                try:
+                    corrected_profile = json.loads(corrected_json)
+                    await db_service.update_user(user.id, {"profile_summary": corrected_profile})
+
+                    await update.message.reply_text(
+                        "✅ <b>Профиль обновлён!</b>\n\n"
+                        f"Применено: {correction_request}\n\n"
+                        "Проверь изменения: /myprofile",
+                        parse_mode=ParseMode.HTML
+                    )
+                except json.JSONDecodeError:
+                    await update.message.reply_text(
+                        "⚠️ Не удалось обработать запрос. Попробуй сформулировать иначе."
+                    )
+                except Exception as db_err:
+                    logger.error(f"Ошибка сохранения профиля для {user.id}: {db_err}")
+                    await update.message.reply_text(
+                        "⚠️ Не удалось сохранить изменения профиля. Попробуй ещё раз."
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Ошибка исправления профиля для {user.id}: {e}")
+                await update.message.reply_text("❌ Произошла ошибка. Попробуй позже.")
+
+        # Регистрируем обработчик команды /correct
+        application.add_handler(CommandHandler("correct", handle_correct))
+
+        async def _get_current_model(user_id: int) -> str:
+            """Возвращает текущую модель пользователя (litellm/model или provider/model)."""
+            user_data = await db_service.get_user(user_id)
+            return (user_data.get('selected_model') if user_data else None) or \
+                   f"{ai_engine.default_provider_name}/{ai_engine.default_model}"
+
+        async def _build_categories_keyboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+            """Строит клавиатуру категорий моделей (первый экран /model)."""
+            from services.model_catalog import get_model_meta, MODEL_HINTS, FAMILY_ORDER, GEMINI_MODELS, NVIDIA_MODELS
+
+            current = await _get_current_model(user_id)
+
+            if not model_catalog or not model_catalog.is_available:
+                lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n"]
+                lines.append("🔵 <b>Gemini:</b>")
+                for short_name in GEMINI_MODELS:
+                    lines.append(f"  <code>/model {short_name}</code>")
+                lines.append("\n🟢 <b>NVIDIA NIM:</b>")
+                for short_name in NVIDIA_MODELS:
+                    lines.append(f"  <code>/model {short_name}</code>")
+                return "\n".join(lines), None
+
+            groups = await model_catalog.get_models_grouped()
+            text = f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n\n🤖 <b>Выбери категорию:</b>"
+
+            buttons = []
+            for family in FAMILY_ORDER:
+                if family not in groups:
+                    continue
+                models = groups[family]
+                # Получаем emoji для семейства
+                meta = get_model_meta(models[0])
+                emoji = meta.get("emoji", "⬜")
+                count = len(models)
+                # Проверяем, есть ли текущая модель в этой категории
+                current_model = current.split("/", 1)[-1] if "/" in current else current
+                has_current = any(m == current_model for m in models)
+                check = " ✅" if has_current else ""
+                btn_text = f"{emoji} {family} ({count}){check}"
+                # callback data: mc:Family (mc = model category)
+                buttons.append([InlineKeyboardButton(btn_text, callback_data=f"mc:{family}")])
+
+            # Добавить оставшиеся группы не в FAMILY_ORDER
+            for family, models in groups.items():
+                if family in FAMILY_ORDER:
+                    continue
+                meta = get_model_meta(models[0])
+                emoji = meta.get("emoji", "⬜")
+                count = len(models)
+                buttons.append([InlineKeyboardButton(f"{emoji} {family} ({count})", callback_data=f"mc:{family}")])
+
+            return text, InlineKeyboardMarkup(buttons)
+
+        async def _build_models_keyboard(user_id: int, family: str) -> tuple[str, InlineKeyboardMarkup]:
+            """Строит клавиатуру моделей внутри категории (второй экран)."""
+            from services.model_catalog import get_model_meta, MODEL_HINTS
+
+            current = await _get_current_model(user_id)
+            current_model = current.split("/", 1)[-1] if "/" in current else current
+
+            if not model_catalog:
+                return "❌ Каталог моделей недоступен.", InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mback")]])
+
+            groups = await model_catalog.get_models_grouped()
+            models = groups.get(family, [])
+
+            if not models:
+                return f"❌ Категория {family} пуста.", InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mback")]])
+
+            meta = get_model_meta(models[0])
+            emoji = meta.get("emoji", "⬜")
+            text = f"{emoji} <b>{family}</b> — выбери модель:"
+
+            buttons = []
+            for model_id in models:
+                hint = MODEL_HINTS.get(model_id, "")
+                check = " ✅" if model_id == current_model else ""
+                label = f"{model_id}{check}"
+                if hint:
+                    label = f"{model_id} {hint}{check}"
+                # callback data: ms:model_id (ms = model select)
+                # Telegram limit: 64 bytes. model_id + prefix should fit
+                cb_data = f"ms:{model_id}"
+                if len(cb_data.encode('utf-8')) > 64:
+                    cb_data = f"ms:{model_id[:55]}"
+                buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+            buttons.append([InlineKeyboardButton("« Назад", callback_data="mback")])
+            return text, InlineKeyboardMarkup(buttons)
+
+        async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /model — переключение AI-модели.
+            /model — показать inline-клавиатуру с категориями
+            /model kimi-k2 — переключить по короткому имени (power-user shortcut)
+            /model litellm/claude-opus-4.6 — переключить на конкретную LiteLLM модель
+            """
+            from services.ai_engine import (
+                OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP, parse_model_string,
+            )
+            from services.model_catalog import DEFAULT_MODELS, NVIDIA_MODELS, GEMINI_MODELS
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            args = context.args
+
+            if not args:
+                # Inline keyboard UI
+                text, keyboard = await _build_categories_keyboard(user.id)
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                return
+
+            # Power-user shortcut: /model model-name
+            model_string = " ".join(args).strip()
+
+            # Сначала проверяем, есть ли модель в LiteLLM каталоге
+            if model_catalog and model_catalog.is_available:
+                models = await model_catalog.get_models()
+                if model_string in models:
+                    # Прямое совпадение с LiteLLM моделью
+                    try:
+                        await db_service.update_user(user.id, {"selected_model": f"litellm/{model_string}"})
+                    except Exception as db_err:
+                        logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                        await update.message.reply_text("⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.")
+                        return
+                    await update.message.reply_text(
+                        f"✅ Модель: <code>litellm/{model_string}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+
+            # Fallback: старый парсинг (gemini-3-flash, nvidia/kimi-k2 и т.д.)
+            provider_name, model = parse_model_string(model_string)
+
+            all_providers = set(PROVIDER_MAP.keys()) | set(OPENAI_COMPATIBLE_PROVIDERS.keys())
+            if provider_name not in all_providers:
+                await update.message.reply_text(
+                    f"❌ Неизвестная модель: <code>{model_string}</code>\n\n"
+                    f"Используй /model для списка.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            try:
+                ai_engine.get_provider(provider_name, model)
+                await db_service.update_user(user.id, {"selected_model": f"{provider_name}/{model}"})
+                await update.message.reply_text(
+                    f"✅ Модель: <code>{provider_name}/{model}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            except ValueError as e:
+                await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.HTML)
+            except Exception as db_err:
+                logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                await update.message.reply_text("⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.")
+
+        application.add_handler(CommandHandler("model", handle_model))
+
+        async def handle_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /memory — тест и статистика долговременной памяти.
+            /memory — показать статистику
+            /memory search запрос — поиск по памяти
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            if not memory_service:
+                await update.message.reply_text("❌ Memory Service не инициализирован.")
+                return
+
+            args = context.args or []
+
+            if args and args[0] == "search" and len(args) > 1:
+                # Поиск по памяти
+                query = " ".join(args[1:])
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+                results = await memory_service.search_memory(user.id, query, limit=5)
+
+                if not results:
+                    await update.message.reply_text(f"🔍 По запросу «{query}» ничего не найдено в памяти.")
+                    return
+
+                text = f"🔍 <b>Результаты поиска:</b> «{query}»\n\n"
+                for i, r in enumerate(results, 1):
+                    score = r.get('score', 0)
+                    content_preview = r['content'][:200]
+                    text += f"{i}. 🧠 (score: {score:.2f}) {content_preview}\n\n"
+
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            else:
+                # Статистика памяти (через Mem0 API)
+                try:
+                    all_memories = await memory_service.get_all_memories(user.id, limit=500)
+                    total = len(all_memories)
+
+                    text = f"""🧠 <b>Долговременная память (Mem0)</b>
+
+📊 <b>Статистика:</b>
+  Извлечённых фактов: {total}
+
+💡 <b>Команды:</b>
+  <code>/memory search запрос</code> — поиск по памяти
+
+ℹ️ Mem0 автоматически извлекает факты из каждого разговора, дедуплицирует и обновляет существующие.
+Поиск по памяти происходит при каждом сообщении — триггерные слова не нужны."""
+
+                    # Показать последние 5 фактов
+                    if all_memories:
+                        text += "\n\n📝 <b>Последние факты:</b>\n"
+                        for m in all_memories[:5]:
+                            memory_text = m.get("memory", "")[:150]
+                            text += f"  • {memory_text}\n"
+
+                    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                except Exception as e:
+                    logger.error(f"Ошибка получения статистики памяти для {user.id}: {e}")
+                    await update.message.reply_text(f"❌ Ошибка: {e}")
+
+        application.add_handler(CommandHandler("memory", handle_memory))
+
+        async def handle_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает команду /bulk — режим массовой загрузки данных.
+            /bulk — включить/выключить режим
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            if not memory_service:
+                await update.message.reply_text("❌ Memory Service не инициализирован.")
+                return
+
+            if user.id in bulk_mode_users:
+                # Выключаем режим
+                count = bulk_mode_users.pop(user.id, 0)
+                await update.message.reply_text(
+                    f"📴 <b>Режим загрузки выключен</b>\n\n"
+                    f"📊 Загружено записей: {count}\n"
+                    f"Все данные сохранены с эмбеддингами и доступны для поиска.\n\n"
+                    f"Проверь: /memory",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # Включаем режим
+                bulk_mode_users[user.id] = 0
+                await update.message.reply_text(
+                    "📥 <b>Режим массовой загрузки ВКЛЮЧЁН</b>\n\n"
+                    "Теперь можешь отправлять данные пачкой — текст, голосовые, файлы.\n"
+                    "ИИ не будет отвечать, всё сохраняется напрямую в долговременную память "
+                    "с векторными эмбеддингами.\n\n"
+                    "📎 <b>Поддерживаемые файлы:</b>\n"
+                    "  • TXT — текстовые файлы\n"
+                    "  • PDF — документы\n"
+                    "  • DOCX — Word-документы\n"
+                    "  • CSV — таблицы (сохраняются построчно)\n"
+                    "  • JSON — данные\n\n"
+                    "Для выхода из режима: /bulk",
+                    parse_mode=ParseMode.HTML
+                )
+
+        application.add_handler(CommandHandler("bulk", handle_bulk))
+
+        # --- Админ-команды ---
+        OWNER_ID = 292628110
+
+        async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Админ-команды для управления ботом.
+            Доступно только владельцу (OWNER_ID).
+
+            Использование:
+              /admin add <user_id>     — добавить пользователя
+              /admin remove <user_id>  — удалить пользователя
+              /admin list              — список разрешённых
+              /admin stats             — статистика
+            """
+            user = update.effective_user
+            if user.id != OWNER_ID:
+                return  # Молча игнорируем
+
+            args = context.args if context.args else []
+
+            if not args:
+                help_text = (
+                    "🔧 <b>Админ-панель</b>\n\n"
+                    "Команды:\n"
+                    "<code>/admin add {user_id}</code> — добавить пользователя\n"
+                    "<code>/admin remove {user_id}</code> — удалить пользователя\n"
+                    "<code>/admin list</code> — список разрешённых\n"
+                    "<code>/admin stats</code> — статистика\n"
+                )
+                await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+                return
+
+            action = args[0].lower()
+
+            if action == "add" and len(args) >= 2:
+                try:
+                    new_uid = int(args[1])
+                    allowed_users.add(new_uid)
+                    # Персистим в Firestore
+                    saved = await db_service.save_allowed_users(allowed_users)
+                    persist_status = "💾 Сохранено в Firestore." if saved else "⚠️ Не удалось сохранить в Firestore!"
+                    logger.info(f"Админ добавил пользователя {new_uid}. Текущий список: {allowed_users}")
+                    await update.message.reply_text(
+                        f"✅ Пользователь <code>{new_uid}</code> добавлен.\n"
+                        f"Всего разрешённых: {len(allowed_users)}\n"
+                        f"{persist_status}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except ValueError:
+                    await update.message.reply_text("❌ Неверный ID. Укажите числовой Telegram user_id.")
+
+            elif action == "remove" and len(args) >= 2:
+                try:
+                    rm_uid = int(args[1])
+                    if rm_uid == OWNER_ID:
+                        await update.message.reply_text("❌ Нельзя удалить владельца.")
+                        return
+                    allowed_users.discard(rm_uid)
+                    # Персистим в Firestore
+                    saved = await db_service.save_allowed_users(allowed_users)
+                    persist_status = "💾 Сохранено в Firestore." if saved else "⚠️ Не удалось сохранить в Firestore!"
+                    logger.info(f"Админ удалил пользователя {rm_uid}. Текущий список: {allowed_users}")
+                    await update.message.reply_text(
+                        f"✅ Пользователь <code>{rm_uid}</code> удалён.\n"
+                        f"Всего разрешённых: {len(allowed_users)}\n"
+                        f"{persist_status}",
+                        parse_mode=ParseMode.HTML
+                    )
+                except ValueError:
+                    await update.message.reply_text("❌ Неверный ID. Укажите числовой Telegram user_id.")
+
+            elif action == "list":
+                if not allowed_users:
+                    await update.message.reply_text("🔓 Режим открытого доступа (ALLOWED_USERS пуст — все допущены).")
+                else:
+                    lines = []
+                    for uid in sorted(allowed_users):
+                        user_data = await db_service.get_user(uid)
+                        if user_data:
+                            name = user_data.get('first_name', '')
+                            username = user_data.get('username', '')
+                            label = f"{name} (@{username})" if username else name
+                            lines.append(f"• <code>{uid}</code> — {label}")
+                        else:
+                            lines.append(f"• <code>{uid}</code>")
+                    users_list = "\n".join(lines)
+                    await update.message.reply_text(
+                        f"👥 <b>Разрешённые пользователи ({len(allowed_users)}):</b>\n{users_list}",
+                        parse_mode=ParseMode.HTML
+                    )
+
+            elif action == "stats":
+                total_allowed = len(allowed_users) if allowed_users else "∞ (все)"
+                bulk_active = len(bulk_mode_users)
+                await update.message.reply_text(
+                    f"📊 <b>Статистика</b>\n\n"
+                    f"Разрешённых пользователей: {total_allowed}\n"
+                    f"В режиме bulk: {bulk_active}",
+                    parse_mode=ParseMode.HTML
+                )
+
+            else:
+                await update.message.reply_text(
+                    "❓ Неизвестная команда. Используйте /admin без аргументов для справки."
+                )
+
+        application.add_handler(CommandHandler("admin", handle_admin))
+
+        # --- Vault (персональное хранилище) ---
+
+        async def handle_vault(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Обрабатывает команду /vault."""
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            args = context.args
+
+            # /vault save <title> — быстрое сохранение последнего ответа
+            if args and args[0].lower() == "save":
+                title = " ".join(args[1:]).strip() if len(args) > 1 else ""
+                if not title:
+                    await update.message.reply_text(
+                        "⚠️ Укажи заголовок: <code>/vault save Название</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+
+                # Берём последнее сообщение ассистента
+                history = await db_service.get_last_messages(user.id, limit=5)
+                last_assistant = None
+                for msg in reversed(history):
+                    if msg.get('role') == 'assistant':
+                        last_assistant = msg.get('content', '')
+                        break
+
+                if not last_assistant:
+                    await update.message.reply_text("⚠️ Нет недавних ответов для сохранения.")
+                    return
+
+                try:
+                    doc_id = await db_service.vault_save(
+                        user.id, title, last_assistant, item_type="note"
+                    )
+                    preview = last_assistant[:100] + "..." if len(last_assistant) > 100 else last_assistant
+                    await update.message.reply_text(
+                        f"✅ Сохранено в хранилище\n\n"
+                        f"<b>{html.escape(title)}</b>\n"
+                        f"<i>{html.escape(preview)}</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except ValueError as e:
+                    await update.message.reply_text(f"⚠️ {e}")
+                except Exception as e:
+                    logger.error(f"Vault save error for {user.id}: {e}")
+                    await update.message.reply_text("⚠️ Не удалось сохранить. Попробуй позже.")
+                return
+
+            # /vault — показать список или empty state
+            try:
+                items = await db_service.vault_list(user.id, limit=10)
+            except Exception as e:
+                logger.error(f"Vault list error for {user.id}: {e}")
+                await update.message.reply_text("⚠️ Ошибка загрузки хранилища.")
+                return
+
+            if not items:
+                await update.message.reply_text(
+                    "📦 <b>Хранилище пусто</b>\n\n"
+                    "Здесь можно сохранять промпты, идеи и заметки.\n\n"
+                    "👉 <code>/vault save Название</code> — сохранить последний ответ\n"
+                    "👉 Скажи мне «сохрани это как промпт» — я помогу\n"
+                    "👉 <code>Запиши идею: текст идеи</code> — быстрая заметка",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # Отображаем список
+            type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+            lines = ["📦 <b>Твоё хранилище</b>\n"]
+            buttons = []
+            for item in items:
+                emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                title = item.get('title', 'Без названия')[:40]
+                date_str = ""
+                if item.get('created_at'):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(item['created_at'].replace('+00:00', ''))
+                        date_str = dt.strftime("%d.%m")
+                    except Exception:
+                        pass
+                preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                lines.append(f"{emoji} <b>{html.escape(title)}</b> {date_str}\n<i>{html.escape(preview)}</i>\n")
+                buttons.append([InlineKeyboardButton(
+                    f"{emoji} {title}",
+                    callback_data=f"vault:view:{item['id'][:20]}"
+                )])
+
+            # Кнопка пагинации если 10 элементов (может быть ещё)
+            if len(items) == 10:
+                last_id = items[-1]['id']
+                buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+            text = "\n".join(lines)
+            keyboard = InlineKeyboardMarkup(buttons)
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+        application.add_handler(CommandHandler("vault", handle_vault))
+
+        # --- Vault dialog save (обработка фразы "Запиши идею: ..." в process_dialog_turn) ---
+        _vault_save_patterns = re.compile(
+            r'^(?:запиши|сохрани)\s+(?:идею|промпт|заметку)\s*[:：]\s*(.+)',
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        async def extract_text_from_file(file_bytes: bytes, file_name: str) -> str | None:
+            """Извлекает текст из файла по расширению."""
+            ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else ''
+
+            try:
+                if ext == 'txt':
+                    return file_bytes.decode('utf-8', errors='replace')
+
+                elif ext == 'pdf':
+                    try:
+                        from PyPDF2 import PdfReader
+                        reader = PdfReader(io.BytesIO(file_bytes))
+                        pages = []
+                        for page in reader.pages:
+                            text = page.extract_text()
+                            if text:
+                                pages.append(text)
+                        return '\n\n'.join(pages) if pages else None
+                    except ImportError:
+                        logger.warning("PyPDF2 не установлен, PDF не поддерживается")
+                        return None
+
+                elif ext == 'docx':
+                    try:
+                        from docx import Document
+                        doc = Document(io.BytesIO(file_bytes))
+                        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+                        return '\n\n'.join(paragraphs) if paragraphs else None
+                    except ImportError:
+                        logger.warning("python-docx не установлен, DOCX не поддерживается")
+                        return None
+
+                elif ext == 'csv':
+                    text = file_bytes.decode('utf-8', errors='replace')
+                    return text  # Сохраняем CSV как текст
+
+                elif ext == 'json':
+                    data = json.loads(file_bytes.decode('utf-8', errors='replace'))
+                    return json.dumps(data, ensure_ascii=False, indent=2)
+
+                else:
+                    # Пробуем как текст
+                    decoded = file_bytes.decode('utf-8', errors='strict')
+                    return decoded
+            except Exception as e:
+                logger.error(f"Ошибка извлечения текста из {file_name}: {e}")
+                return None
+
+        async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает загруженные файлы/документы.
+            В bulk-режиме: извлекает текст и сохраняет в память.
+            В обычном режиме: извлекает текст и обрабатывает как сообщение.
+            """
+            user = update.effective_user
+            if not is_authorized(user.id):
+                return
+
+            document = update.message.document
+            if not document:
+                return
+
+            file_name = document.file_name or "unknown"
+            file_size = document.file_size or 0
+            logger.info(f"Получен документ от {user.id}: {file_name} ({file_size} bytes)")
+
+            # Ограничение размера (10MB)
+            if file_size > 10 * 1024 * 1024:
+                await update.message.reply_text("❌ Файл слишком большой (макс. 10 МБ).")
+                return
+
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+                # Скачиваем файл
+                file = await document.get_file()
+                with io.BytesIO() as buffer:
+                    await file.download_to_memory(out=buffer)
+                    buffer.seek(0)
+                    file_bytes = buffer.read()
+
+                # Извлекаем текст
+                text = await extract_text_from_file(file_bytes, file_name)
+
+                if not text or len(text.strip()) < 5:
+                    await update.message.reply_text(
+                        f"⚠️ Не удалось извлечь текст из <code>{file_name}</code>.\n"
+                        "Поддерживаемые форматы: TXT, PDF, DOCX, CSV, JSON",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+
+                caption = update.message.caption or ""
+
+                if user.id in bulk_mode_users:
+                    # Bulk-режим: сохраняем в память напрямую
+                    if memory_service:
+                        import asyncio
+                        # Разбиваем длинные тексты на чанки по ~1500 символов
+                        chunks = _split_text_to_chunks(text, max_len=1500)
+                        for chunk in chunks:
+                            content = f"[Файл: {file_name}] {chunk}"
+                            await memory_service.store_message(user.id, "user", content)
+
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + len(chunks)
+                        await update.message.reply_text(
+                            f"✅ <code>{file_name}</code> — {len(chunks)} фрагмент(ов), "
+                            f"{len(text)} символов",
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        await update.message.reply_text("❌ Memory Service не доступен.")
+                else:
+                    # Обычный режим: обрабатываем как текстовое сообщение
+                    # Обрезаем для AI (макс ~3000 символов)
+                    truncated = text[:3000]
+                    user_text = f"[Файл: {file_name}] {caption}\n\n{truncated}" if caption else f"[Файл: {file_name}]\n\n{truncated}"
+                    if len(text) > 3000:
+                        user_text += f"\n\n... (обрезано, всего {len(text)} символов)"
+                    await process_dialog_turn(user, update.effective_chat.id, user_text, context)
+
+            except Exception as e:
+                logger.error(f"Ошибка обработки документа от {user.id}: {e}")
+                await update.message.reply_text(f"❌ Ошибка обработки файла: {e}")
+
+        def _split_text_to_chunks(text: str, max_len: int = 1500) -> list[str]:
+            """Разбивает текст на чанки для эмбеддинга."""
+            if len(text) <= max_len:
+                return [text]
+
+            chunks = []
+            paragraphs = text.split('\n\n')
+            current = ""
+
+            for para in paragraphs:
+                if len(current) + len(para) + 2 <= max_len:
+                    current += para + "\n\n"
+                else:
+                    if current.strip():
+                        chunks.append(current.strip())
+                    # Если абзац сам длиннее max_len — нарезаем по предложениям
+                    if len(para) > max_len:
+                        words = para.split()
+                        current = ""
+                        for word in words:
+                            if len(current) + len(word) + 1 <= max_len:
+                                current += word + " "
+                            else:
+                                if current.strip():
+                                    chunks.append(current.strip())
+                                current = word + " "
+                    else:
+                        current = para + "\n\n"
+
+            if current.strip():
+                chunks.append(current.strip())
+
+            return chunks if chunks else [text[:max_len]]
+
+        async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает нажатия на inline-кнопки.
+            """
+            query = update.callback_query
+            await query.answer()  # Убираем "часики" на кнопке
+            
+            user = query.from_user
+            data = query.data
+            logger.info(f"Callback {data} от {user.id}")
+            
+            if data == "cmd_myprofile":
+                # Показать профиль
+                user_data = await db_service.get_user(user.id)
+                if not user_data or 'profile_summary' not in user_data:
+                    await query.message.reply_text(
+                        "📋 <b>Профиль пока пуст</b>\n\nПообщайся со мной, чтобы я узнал тебя лучше!",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    profile = user_data['profile_summary']
+                    text = "📋 <b>Твой профиль</b>\n\n"
+                    if isinstance(profile, dict):
+                        if profile.get('summary'):
+                            text += f"📝 {profile['summary']}\n\n"
+                        if profile.get('interests'):
+                            text += f"🎯 <b>Интересы:</b> {', '.join(profile['interests'][:5])}\n"
+                        if profile.get('dreams'):
+                            text += f"💭 <b>Цели:</b> {', '.join(profile['dreams'][:3])}\n"
+                    await query.message.reply_text(text, parse_mode=ParseMode.HTML)
+                    
+            elif data == "cmd_help":
+                help_text = """📚 <b>Что я умею:</b>
+
+🎯 <b>Учусь понимать тебя</b> — собираю профиль из диалогов
+📋 /myprofile — твоё досье
+📦 /vault — хранилище промптов и идей
+✏️ /correct — исправить ошибку в профиле
+🏷 /name — дать мне имя
+🗑 /clear — очистить историю
+
+💬 Просто пиши или 🎤 отправляй голосовые!"""
+                await query.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+                
+            elif data == "cmd_continue":
+                await query.message.reply_text("Слушаю тебя! О чём поговорим? 💬")
+                
+            elif data == "cmd_name_hint":
+                await query.message.reply_text(
+                    "🏷 <b>Дай мне имя!</b>\n\nНапиши: /name <i>Твоё_имя_для_меня</i>\n\nНапример: /name Макс",
+                    parse_mode=ParseMode.HTML
+                )
+                
+            elif data == "start_interview":
+                await query.message.reply_text(
+                    "🎤 <b>Давай познакомимся!</b>\n\n"
+                    "Расскажи немного о себе:\n"
+                    "— Чем занимаешься?\n"
+                    "— Какая главная цель на ближайший месяц?\n\n"
+                    "Можешь написать текстом или записать голосовое 🎙",
+                    parse_mode=ParseMode.HTML
+                )
+                
+            elif data == "start_freeform":
+                await query.message.reply_text(
+                    "💬 Отлично! Просто пиши мне о чём угодно.\n\n"
+                    "Я буду постепенно узнавать тебя из наших диалогов. Начинай! 🚀"
+                )
+
+            # --- Model selection callbacks ---
+            elif data.startswith("mc:") or data == "mback" or data.startswith("ms:"):
+                if not is_authorized(user.id):
+                    return
+
+                if data.startswith("mc:"):
+                    family = data[3:]
+                    if family == "categories":
+                        # Переход к полному каталогу категорий
+                        text, keyboard = await _build_categories_keyboard(user.id)
+                    else:
+                        # Категория выбрана — показываем модели внутри
+                        text, keyboard = await _build_models_keyboard(user.id, family)
+                elif data == "mback":
+                    # Назад к категориям
+                    text, keyboard = await _build_categories_keyboard(user.id)
+                else:
+                    # ms: — модель выбрана
+                    model_id = data[3:]
+                    # Проверяем, что модель ещё есть в каталоге
+                    if model_catalog and model_catalog.is_available:
+                        models = await model_catalog.get_models()
+                        if model_id not in models:
+                            text = f"⚠️ Модель <code>{model_id}</code> больше недоступна.\n\nВыбери другую:"
+                            keyboard = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                            ])
+                            try:
+                                await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                            except Exception:
+                                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                            return
+
+                    try:
+                        await db_service.update_user(user.id, {"selected_model": f"litellm/{model_id}"})
+                    except Exception as db_err:
+                        logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                        text = "⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз."
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                        ])
+                        try:
+                            await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                        except Exception:
+                            await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                        return
+                    logger.info(f"Пользователь {user.id} выбрал модель: litellm/{model_id}")
+                    from services.model_catalog import get_model_meta, MODEL_HINTS
+                    meta = get_model_meta(model_id)
+                    hint = MODEL_HINTS.get(model_id, "")
+                    hint_str = f" ({hint})" if hint else ""
+                    text = f"✅ Модель переключена:\n\n{meta.get('emoji', '')} <code>{model_id}</code>{hint_str}"
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("« Все модели", callback_data="mback")]
+                    ])
+
+                try:
+                    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                except Exception:
+                    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+            # --- Recommendation switch callbacks (mswitch:) ---
+            elif data.startswith("mswitch:"):
+                if not is_authorized(user.id):
+                    return
+
+                choice = data[8:]  # after "mswitch:"
+
+                if choice == "keep":
+                    try:
+                        await query.message.edit_text(
+                            "👌 Оставляю текущую модель.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await query.message.reply_text("👌 Оставляю текущую модель.")
+                    return
+
+                # Маппинг алиасов для кнопок рекомендации
+                _recommend_aliases = {
+                    "claude": ("anthropic", "claude-sonnet-4-20250514"),
+                    "gpt": ("openai", "gpt-4o"),
+                }
+
+                if choice in _recommend_aliases:
+                    prov, mdl = _recommend_aliases[choice]
+                    selected_str = f"{prov}/{mdl}"
+                else:
+                    # Пробуем через стандартный резолвер
+                    resolved = await _resolve_and_switch_model(user.id, choice, db_service, model_catalog, ai_engine)
+                    if resolved:
+                        from services.model_catalog import get_model_meta
+                        meta = get_model_meta(choice)
+                        try:
+                            await query.message.edit_text(
+                                f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            await query.message.reply_text(
+                                f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        return
+                    else:
+                        try:
+                            await query.message.edit_text(
+                                f"⚠️ Модель <code>{choice}</code> недоступна.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception:
+                            await query.message.reply_text(
+                                f"⚠️ Модель <code>{choice}</code> недоступна.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        return
+
+                # Для алиасов (claude, gpt) — сохраняем напрямую
+                try:
+                    await db_service.update_user(user.id, {"selected_model": selected_str})
+                except Exception as db_err:
+                    logger.error(f"Ошибка сохранения модели для {user.id}: {db_err}")
+                    try:
+                        await query.message.edit_text(
+                            "⚠️ Не удалось сохранить выбор модели. Попробуй ещё раз.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                from services.model_catalog import get_model_meta
+                meta = get_model_meta(choice)
+                logger.info(f"Пользователь {user.id} выбрал рекомендованную модель: {selected_str}")
+                try:
+                    await query.message.edit_text(
+                        f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    await query.message.reply_text(
+                        f"✅ Модель переключена: {meta.get('emoji', '')} <b>{meta.get('label', choice)}</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+            # --- Vault callbacks ---
+            elif data.startswith("vault:"):
+                if not is_authorized(user.id):
+                    return
+
+                parts = data.split(":", 2)
+                action = parts[1] if len(parts) > 1 else ""
+                param = parts[2] if len(parts) > 2 else ""
+
+                if action == "view" and param:
+                    # Показать полное содержимое элемента
+                    item = await db_service.vault_get(user.id, param)
+                    if not item:
+                        try:
+                            await query.message.edit_text("⚠️ Элемент не найден.")
+                        except Exception:
+                            await query.message.reply_text("⚠️ Элемент не найден.")
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                    title = item.get('title', 'Без названия')
+                    content = item.get('content', '')
+                    # Обрезаем контент если слишком длинный для Telegram
+                    if len(content) > 3000:
+                        content = content[:3000] + "\n\n<i>... (обрезано)</i>"
+
+                    text = (
+                        f"{emoji} <b>{html.escape(title)}</b>\n\n"
+                        f"{html.escape(content)}"
+                    )
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Удалить", callback_data=f"vault:del:{param}"),
+                            InlineKeyboardButton("« Назад", callback_data="vault:back"),
+                        ]
+                    ])
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "del" and param:
+                    # Подтверждение удаления
+                    item = await db_service.vault_get(user.id, param)
+                    title = item.get('title', 'элемент') if item else 'элемент'
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Да, удалить", callback_data=f"vault:confirm_del:{param}"),
+                            InlineKeyboardButton("« Отмена", callback_data="vault:back"),
+                        ]
+                    ])
+                    try:
+                        await query.message.edit_text(
+                            f"Удалить <b>{html.escape(title)}</b>?",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=keyboard,
+                        )
+                    except Exception:
+                        pass
+
+                elif action == "confirm_del" and param:
+                    # Удаление
+                    try:
+                        deleted = await db_service.vault_delete(user.id, param)
+                        if deleted:
+                            text = "✅ Удалено."
+                        else:
+                            text = "⚠️ Элемент уже удалён."
+                    except Exception as e:
+                        logger.error(f"Vault delete error for {user.id}: {e}")
+                        text = "⚠️ Ошибка удаления."
+                    try:
+                        await query.message.edit_text(text)
+                    except Exception:
+                        await query.message.reply_text(text)
+
+                elif action == "page" and param:
+                    # Пагинация — следующая страница
+                    try:
+                        items = await db_service.vault_list(user.id, limit=10, cursor=param)
+                    except Exception as e:
+                        logger.error(f"Vault page error: {e}")
+                        return
+
+                    if not items:
+                        try:
+                            await query.message.edit_text("📦 Больше элементов нет.")
+                        except Exception:
+                            pass
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    lines = ["📦 <b>Хранилище (продолжение)</b>\n"]
+                    buttons = []
+                    for item in items:
+                        emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                        t = item.get('title', 'Без названия')[:40]
+                        preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                        lines.append(f"{emoji} <b>{html.escape(t)}</b>\n<i>{html.escape(preview)}</i>\n")
+                        buttons.append([InlineKeyboardButton(
+                            f"{emoji} {t}",
+                            callback_data=f"vault:view:{item['id'][:20]}"
+                        )])
+
+                    if len(items) == 10:
+                        last_id = items[-1]['id']
+                        buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+                    text = "\n".join(lines)
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "back":
+                    # Назад к списку
+                    try:
+                        items = await db_service.vault_list(user.id, limit=10)
+                    except Exception:
+                        return
+
+                    if not items:
+                        try:
+                            await query.message.edit_text("📦 Хранилище пусто.")
+                        except Exception:
+                            pass
+                        return
+
+                    type_emoji = {"prompt": "📝", "idea": "💡", "note": "📌"}
+                    lines = ["📦 <b>Твоё хранилище</b>\n"]
+                    buttons = []
+                    for item in items:
+                        emoji = type_emoji.get(item.get('type', 'note'), '📌')
+                        t = item.get('title', 'Без названия')[:40]
+                        preview = (item.get('content', '')[:50] + "...") if len(item.get('content', '')) > 50 else item.get('content', '')
+                        lines.append(f"{emoji} <b>{html.escape(t)}</b>\n<i>{html.escape(preview)}</i>\n")
+                        buttons.append([InlineKeyboardButton(
+                            f"{emoji} {t}",
+                            callback_data=f"vault:view:{item['id'][:20]}"
+                        )])
+
+                    if len(items) == 10:
+                        last_id = items[-1]['id']
+                        buttons.append([InlineKeyboardButton("Ещё ▶️", callback_data=f"vault:page:{last_id[:20]}")])
+
+                    text = "\n".join(lines)
+                    keyboard = InlineKeyboardMarkup(buttons)
+                    try:
+                        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                    except Exception:
+                        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+                elif action == "save_confirm" and param:
+                    # Подтверждение сохранения из диалога (param = doc_id уже сохранённого)
+                    try:
+                        await query.message.edit_text("✅ Сохранено в хранилище.")
+                    except Exception:
+                        pass
+
+                elif action == "save_cancel":
+                    try:
+                        await query.message.edit_text("👌 Не сохраняю.")
+                    except Exception:
+                        pass
+
+        # Регистрируем обработчик callback query (inline кнопки)
+        application.add_handler(CallbackQueryHandler(handle_callback))
+
+        # Регистрируем обработчик текстовых сообщений
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+        # Регистрируем обработчик голосовых сообщений
+        application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+        async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            Обрабатывает изображения от пользователя.
+            В bulk-режиме: описывает фото через AI и сохраняет описание в память.
+            """
+            user = update.effective_user
+            logger.info(f"Получено фото от {user.id}")
+
+            if not ai_engine:
+                await update.message.reply_text("❌ Сервис ИИ временно недоступен.")
+                return
+
+            # Показываем индикатор "печатает"
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+            try:
+                # Получаем самое большое изображение
+                photo = update.message.photo[-1]
+                file = await photo.get_file()
+                image_bytes = await file.download_as_bytearray()
+                caption = update.message.caption or ""
+
+                if user.id in bulk_mode_users:
+                    # Bulk-режим: описываем фото коротко и сохраняем в память
+                    if memory_service:
+                        import asyncio
+                        # Получаем описание через AI (короткое)
+                        description = await ai_engine.analyze_image(
+                            bytes(image_bytes),
+                            user_message=caption or "Кратко опиши что на изображении (2-3 предложения).",
+                            user_profile=None,
+                            user_name=user.first_name
+                        )
+                        content = f"[Фото] {caption + ': ' if caption else ''}{description}"
+                        asyncio.create_task(memory_service.store_message(user.id, "user", content))
+                        bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
+                        await update.message.reply_text("✅ Фото сохранено в память")
+                    else:
+                        await update.message.reply_text("❌ Memory Service не доступен.")
+                    return
+
+                # Обычный режим
+                user_data = await db_service.get_user(user.id)
+                user_profile = user_data if user_data else None
+
+                # Определяем провайдер пользователя для vision
+                from services.ai_engine import parse_model_string
+                user_provider = None
+                user_model = None
+                user_model_str = user_data.get('selected_model') if user_data else None
+                if user_model_str:
+                    user_provider, user_model = parse_model_string(user_model_str)
+
+                response_text = await ai_engine.analyze_image(
+                    bytes(image_bytes),
+                    user_message=caption,
+                    user_profile=user_profile,
+                    user_name=user.first_name,
+                    provider_name=user_provider,
+                    model=user_model,
+                )
+
+                formatted_response = markdown_to_telegram_html(response_text)
+                await send_long_message(update.message, formatted_response)
+
+            except Exception as e:
+                logger.error(f"Ошибка обработки фото от {user.id}: {e}")
+                await update.message.reply_text("❌ Не удалось обработать изображение.")
+
+        async def send_long_message(message, text: str):
+            """Отправляет длинное сообщение, разбивая на части."""
+            parts = split_message(text)
+            for part in parts:
+                try:
+                    await message.reply_text(part, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await message.reply_text(part)
+
+        # Регистрируем обработчик фото
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+        # Регистрируем обработчик документов/файлов
+        application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+        # Глобальный обработчик ошибок — ловит необработанные исключения в хендлерах
         async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             """Логирует ошибки и уведомляет пользователя."""
             logger.error(f"Исключение при обработке апдейта: {context.error}", exc_info=context.error)
+
+            # Попытка уведомить пользователя
             if isinstance(update, Update) and update.effective_chat:
                 try:
                     await context.bot.send_message(
@@ -101,8 +1937,9 @@ async def create_bot_app(
 
         application.add_error_handler(error_handler)
 
-        # 8. Инициализируем и возвращаем
+        # Инициализируем приложение
         await application.initialize()
+
         logger.info("Telegram Bot Application успешно создано, хендлеры зарегистрированы.")
         return application
 

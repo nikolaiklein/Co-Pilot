@@ -44,7 +44,7 @@ async def generate_with_fallback(
     Returns:
         (response_text, actual_provider, actual_model)
     """
-    from services.model_data import MODEL_FAMILY_META, get_model_meta
+    from services.model_catalog import MODEL_FAMILY_META, get_model_meta
 
     # Строим fallback chain: (1) retry same, (2) same family, (3) default Gemini
     fallback_chain = [(provider_name, model)]
@@ -133,7 +133,7 @@ def format_rotation_footnote(
     if actual_provider == requested_provider and actual_model == requested_model:
         return ""
 
-    from services.model_data import get_model_meta
+    from services.model_catalog import get_model_meta
 
     requested_meta = get_model_meta(requested_model)
     actual_meta = get_model_meta(actual_model)
