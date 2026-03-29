@@ -815,7 +815,12 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
             current = await _get_current_model(user_id)
 
-            if not model_catalog or not model_catalog.is_available:
+            # Пытаемся получить модели (с lazy refresh по TTL)
+            groups = None
+            if model_catalog:
+                groups = await model_catalog.get_models_grouped()
+
+            if not groups:
                 lines = [f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n"]
                 lines.append("🔵 <b>Gemini:</b>")
                 for short_name in GEMINI_MODELS:
@@ -824,8 +829,6 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 for short_name in NVIDIA_MODELS:
                     lines.append(f"  <code>/model {short_name}</code>")
                 return "\n".join(lines), None
-
-            groups = await model_catalog.get_models_grouped()
             text = f"⚙️ <b>Твоя модель:</b> <code>{current}</code>\n\n🤖 <b>Выбери категорию:</b>"
 
             buttons = []
