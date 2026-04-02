@@ -242,7 +242,8 @@ class MemoryService:
     async def get_all_memories(self, user_id: int, limit: int = 100) -> list[dict]:
         """Получить все воспоминания пользователя."""
         try:
-            result = await self.memory.get_all(user_id=str(user_id), limit=limit)
+            memory = await self._ensure_memory()
+            result = await memory.get_all(user_id=str(user_id), limit=limit)
             return result.get("results", [])
         except Exception as e:
             logger.error(f"Ошибка get_all для {user_id}: {e}")
@@ -251,7 +252,8 @@ class MemoryService:
     async def delete_all(self, user_id: int):
         """Удалить все воспоминания пользователя."""
         try:
-            await self.memory.delete_all(user_id=str(user_id))
+            memory = await self._ensure_memory()
+            await memory.delete_all(user_id=str(user_id))
             logger.info(f"Все воспоминания удалены для user {user_id}")
         except Exception as e:
             logger.error(f"Ошибка delete_all для {user_id}: {e}")

@@ -477,8 +477,10 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             Обрабатывает входящие голосовые сообщения.
             """
             user = update.effective_user
-            voice = update.message.voice
+            if not is_authorized(user.id):
+                return
 
+            voice = update.message.voice
             if not voice:
                 return
 
@@ -491,9 +493,6 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 # Получаем файл
                 voice_file = await context.bot.get_file(voice.file_id)
 
-                # Скачиваем файл в память (byte array)
-                # python-telegram-bot поддерживает download_to_memory
-                # Создаем буфер
                 with io.BytesIO() as buffer:
                     await voice_file.download_to_memory(out=buffer)
                     buffer.seek(0)
@@ -501,13 +500,27 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
                 # Транскрибируем аудио
                 transcribed_text = await ai_engine.transcribe_audio(file_bytes)
-                logger.info(f"Транскрипция для {user.id}: {transcribed_text}")
 
-                # Формируем текст сообщения с пометкой
-                user_text = f"[Голосовое сообщение]: {transcribed_text}"
+                # Gate: сервис транскрибации недоступен
+                if transcribed_text is None:
+                    logger.warning(f"Транскрипция не удалась для {user.id}")
+                    await update.message.reply_text(
+                        "⚠️ Сервис транскрибации временно недоступен. Отправьте сообщение текстом."
+                    )
+                    return
 
-                # Запускаем стандартный диалоговый пайплайн
-                await process_dialog_turn(user, update.effective_chat.id, user_text, context)
+                # Gate: речь не распознана (пустой результат)
+                if not transcribed_text.strip():
+                    logger.info(f"Пустая транскрипция для {user.id}")
+                    await update.message.reply_text(
+                        "🎤 Не удалось распознать речь. Попробуйте ещё раз."
+                    )
+                    return
+
+                logger.info(f"Транскрипция для {user.id}: {len(transcribed_text)} chars")
+
+                # Передаём как обычный текст — без префикса
+                await process_dialog_turn(user, update.effective_chat.id, transcribed_text, context)
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке голосового сообщения от {user.id}: {e}")

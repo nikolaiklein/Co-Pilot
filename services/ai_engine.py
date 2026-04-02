@@ -190,9 +190,9 @@ class BaseProvider(ABC):
         """Анализирует контент по заданному промпту (без истории)."""
         ...
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
+    async def transcribe_audio(self, file_bytes: bytes) -> str | None:
         """Транскрибирует аудио. По умолчанию не поддерживается."""
-        return "[Транскрибация аудио не поддерживается этим провайдером]"
+        return None
 
     async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
         """Анализирует изображение. По умолчанию не поддерживается."""
@@ -257,7 +257,7 @@ class GeminiProvider(BaseProvider):
         )
         return response.text.strip() if response.text else ""
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
+    async def transcribe_audio(self, file_bytes: bytes) -> str | None:
         audio_part = self.types.Part.from_bytes(data=file_bytes, mime_type="audio/ogg")
         prompt = "Дословно транскрибируй аудио в текст. Выведи ТОЛЬКО текст речи, без пояснений, без кавычек, без префиксов. Если неразборчиво — '[Не удалось распознать речь]'."
 
@@ -270,7 +270,7 @@ class GeminiProvider(BaseProvider):
                 parts=[self.types.Part.from_text(text=prompt), audio_part]
             )]
         )
-        return response.text.strip() if response.text else "[Не удалось распознать речь]"
+        return response.text.strip() if response.text else None
 
     async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
         image_part = self.types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
@@ -396,7 +396,7 @@ class OpenAIProvider(BaseProvider):
         )
         return (response.choices[0].message.content or "").strip()
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
+    async def transcribe_audio(self, file_bytes: bytes) -> str | None:
         import io
         audio_file = io.BytesIO(file_bytes)
         audio_file.name = "voice.ogg"
@@ -405,7 +405,7 @@ class OpenAIProvider(BaseProvider):
             file=audio_file,
             language="ru",
         )
-        return response.text.strip() if response.text else "[Не удалось распознать речь]"
+        return response.text.strip() if response.text else None
 
     async def analyze_image(self, image_bytes: bytes, prompt: str, system_prompt: str = "") -> str:
         import base64
@@ -743,8 +743,8 @@ class AIEngine:
         logger.info(f"Транскрипция: provider=groq, {elapsed}ms, {len(audio_bytes)} bytes, {len(text)} chars")
         return text
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
-        """Транскрибирует аудио: Groq Whisper → фолбэк на текущий провайдер."""
+    async def transcribe_audio(self, file_bytes: bytes) -> str | None:
+        """Транскрибирует аудио: Groq Whisper → фолбэк на текущий провайдер. Возвращает None при неудаче."""
         try:
             # Сначала пробуем Groq (быстро и бесплатно)
             result = await self._transcribe_groq(file_bytes)
@@ -756,7 +756,7 @@ class AIEngine:
             return await provider.transcribe_audio(file_bytes)
         except Exception as e:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
-            return "[Ошибка обработки аудио]"
+            return None
 
     # Ротация бесплатных NVIDIA моделей для анализа профиля (дешёвые/быстрые первыми)
     ANALYZER_MODELS = [
