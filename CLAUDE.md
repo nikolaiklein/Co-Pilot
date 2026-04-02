@@ -9,7 +9,7 @@ Telegram-бот "Ко-пилот" (@SergeiVladimirovich_bot): эмпатичны
 - **Database**: Google Cloud Firestore (Native mode, europe-west1)
 - **AI**: Multi-provider — Gemini, Claude, OpenAI, NVIDIA NIM (via `AIProvider` abstraction)
 - **Memory**: RAG — Gemini Embedding API (768-dim) + Firestore Vector Search
-- **Deploy**: Google Cloud Run (europe-west1), Docker, GitHub Actions auto-deploy from `test` branch
+- **Deploy**: Google Cloud Run (europe-west1), Docker, GitHub Actions auto-deploy from `main` branch
 - **Auth**: Google Application Default Credentials (ADC) for Firebase/GCP
 
 ## Commands
@@ -24,8 +24,8 @@ uvicorn main:app --reload     # starts on :8080
 docker build -t co-pilot .
 docker run -p 8080:8080 --env-file .env co-pilot
 
-# Deploy (auto via GitHub Actions on push to test branch)
-git push origin test
+# Deploy (auto via GitHub Actions on push to main branch)
+git push origin main
 
 # Set Telegram webhook after deploy
 curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<CLOUD_RUN_URL>/webhook"
@@ -177,7 +177,7 @@ Optional:
 
 ## Current State & Next Steps
 
-**Branch**: `test` (active, deploys to Cloud Run) | `main` (stable)
+**Branch**: `main` (active, deploys to Cloud Run)
 **Code size**: ~2,870 lines Python across 11 files
 **Biggest file**: `telegram_bot.py` (1,098 lines) — scheduled for refactoring
 
@@ -198,7 +198,7 @@ Optional:
 
 ## Deployment
 
-- **CI/CD**: GitHub Actions on push to `test` branch
+- **CI/CD**: GitHub Actions on push to `main` branch
 - **Registry**: Google Artifact Registry (europe-west1)
 - **Cloud Run**: 512Mi memory, 0-3 instances autoscale
 - **Secrets**: GCP Secret Manager (TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, NVIDIA_API_KEY, ALLOWED_USERS, DEFAULT_MODEL)
