@@ -487,8 +487,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             logger.info(f"Получено голосовое сообщение от {user.id}")
 
             try:
-                # Уведомляем пользователя, что слушаем
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_voice")
+                # Уведомляем пользователя, что обрабатываем (typing, не upload_voice — бот ответит текстом)
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
                 # Получаем файл
                 voice_file = await context.bot.get_file(voice.file_id)
