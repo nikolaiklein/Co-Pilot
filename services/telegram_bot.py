@@ -296,6 +296,26 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 # 4. Получаем историю
                 history = await db_service.get_last_messages(user.id, limit=20)
 
+                # Фильтруем отравленные сообщения из истории (legacy error strings и префиксы)
+                _POISON_PATTERNS = (
+                    "[Голосовое сообщение]:",
+                    "[Ошибка обработки аудио]",
+                    "[Транскрибация аудио не поддерживается",
+                    "[Анализ изображений не поддерживается",
+                    "[Не удалось распознать речь]",
+                )
+                def _clean_msg(msg: dict) -> dict:
+                    content = msg.get("content", "")
+                    for pattern in _POISON_PATTERNS:
+                        if content.startswith(pattern):
+                            # Strip prefix, keep actual text if any
+                            if pattern == "[Голосовое сообщение]:" and len(content) > len(pattern):
+                                return {**msg, "content": content[len(pattern):].strip()}
+                            return None  # Drop pure error messages
+                    return msg
+
+                history = [m for m in (_clean_msg(m) for m in history) if m is not None]
+
                 # Исключаем текущее сообщение из истории, если оно там уже есть
                 if history and history[-1]['content'] == user_text and history[-1]['role'] == 'user':
                      history_for_ai = history[:-1]
