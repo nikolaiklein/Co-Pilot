@@ -706,8 +706,10 @@ class AIEngine:
         """Транскрибация через Groq Whisper. Возвращает текст или None при ошибке."""
         api_key = os.getenv("GROQ_API_KEY", "")
         if not api_key:
+            logger.warning("GROQ_API_KEY не задан, пропускаем Groq Whisper")
             return None
 
+        logger.info(f"Groq Whisper: начинаем транскрибацию ({len(audio_bytes)} bytes)")
         form = aiohttp.FormData()
         form.add_field("file", audio_bytes, filename="voice.ogg", content_type="audio/ogg")
         form.add_field("model", self.GROQ_MODEL)
@@ -722,11 +724,15 @@ class AIEngine:
                     timeout=aiohttp.ClientTimeout(total=self.GROQ_TIMEOUT),
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Groq Whisper HTTP {resp.status}, фолбэк на провайдер")
+                        body = await resp.text()
+                        logger.warning(f"Groq Whisper HTTP {resp.status}: {body[:200]}, фолбэк на провайдер")
                         return None
                     data = await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            logger.warning("Groq Whisper таймаут/ошибка, фолбэк на провайдер")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"Groq Whisper таймаут/ошибка: {e}, фолбэк на провайдер")
+            return None
+        except Exception as e:
+            logger.warning(f"Groq Whisper неожиданная ошибка: {type(e).__name__}: {e}")
             return None
 
         text = data.get("text", "").strip()
