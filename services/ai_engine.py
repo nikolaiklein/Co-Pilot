@@ -2,7 +2,10 @@ import os
 import re
 import logging
 import time
+import asyncio
 from abc import ABC, abstractmethod
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -694,9 +697,55 @@ class AIEngine:
             logger.error(f"Ошибка при генерации ответа для {user_id}: {type(e).__name__}")
             return "Произошла ошибка при обращении к ИИ. Пожалуйста, повторите попытку позже."
 
-    async def transcribe_audio(self, file_bytes: bytes) -> str:
-        """Транскрибирует аудио через текущий провайдер."""
+    # --- Groq Whisper (быстрая бесплатная транскрибация) ---
+    GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+    GROQ_MODEL = "whisper-large-v3-turbo"
+    GROQ_TIMEOUT = 15
+
+    async def _transcribe_groq(self, audio_bytes: bytes) -> str | None:
+        """Транскрибация через Groq Whisper. Возвращает текст или None при ошибке."""
+        api_key = os.getenv("GROQ_API_KEY", "")
+        if not api_key:
+            return None
+
+        form = aiohttp.FormData()
+        form.add_field("file", audio_bytes, filename="voice.ogg", content_type="audio/ogg")
+        form.add_field("model", self.GROQ_MODEL)
+
+        t0 = time.monotonic()
         try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.GROQ_API_URL,
+                    data=form,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=aiohttp.ClientTimeout(total=self.GROQ_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Groq Whisper HTTP {resp.status}, фолбэк на провайдер")
+                        return None
+                    data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.warning("Groq Whisper таймаут/ошибка, фолбэк на провайдер")
+            return None
+
+        text = data.get("text", "").strip()
+        if not text:
+            return None
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        logger.info(f"Транскрипция: provider=groq, {elapsed}ms, {len(audio_bytes)} bytes, {len(text)} chars")
+        return text
+
+    async def transcribe_audio(self, file_bytes: bytes) -> str:
+        """Транскрибирует аудио: Groq Whisper → фолбэк на текущий провайдер."""
+        try:
+            # Сначала пробуем Groq (быстро и бесплатно)
+            result = await self._transcribe_groq(file_bytes)
+            if result:
+                return result
+
+            # Фолбэк на текущий провайдер (Gemini/OpenAI)
             provider = self.get_provider()
             return await provider.transcribe_audio(file_bytes)
         except Exception as e:
