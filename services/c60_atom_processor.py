@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -23,6 +24,12 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 from services.c60_models import C60Atom, _DOMAIN_RE
+
+# UUID4 pattern — target_node must be a semantic anchor, never a raw UUID
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 if TYPE_CHECKING:
     from services.ai_engine import BaseProvider
@@ -257,6 +264,20 @@ async def process_message(
     # Normalise bond last_activated timestamps
     for bond in data.get("covalent_bonds", []):
         bond.setdefault("last_activated", now_utc)
+
+    # Willison P2 fix #12: reject atoms where LLM hallucinated UUID target_nodes.
+    # target_node must be a semantic anchor (e.g. "Python разработка"), never a raw UUID.
+    uuid_bonds = [
+        b.get("target_node", "")
+        for b in data.get("covalent_bonds", [])
+        if _UUID_RE.match(str(b.get("target_node", "")))
+    ]
+    if uuid_bonds:
+        logger.warning(
+            f"C60 Topology Engine: UUID target_node detected — returning None "
+            f"(model={model_name}, count={len(uuid_bonds)}, step_label=c60_topology_engine)"
+        )
+        return None
 
     # Brandur P1 fix #6: assert pentagon_domain is from the user's domain list.
     # Only clamp syntactically-valid domains that are not in user_domains.

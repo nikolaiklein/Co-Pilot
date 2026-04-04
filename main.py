@@ -42,6 +42,9 @@ def _setup_logging():
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
 
+    # Suppress httpx INFO logs — they include the bot token in the URL (security)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
 _setup_logging()
 logger = logging.getLogger(__name__)
 

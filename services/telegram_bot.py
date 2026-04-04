@@ -949,6 +949,20 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 
                 try:
                     corrected_profile = json.loads(corrected_json)
+
+                    # Friedman P2 fix #10: validate structure before overwriting profile.
+                    # LLM may return partial JSON or wrong keys — guard against profile corruption.
+                    required_keys = {"new_skills", "interests", "pain_points", "dreams", "summary"}
+                    if not required_keys.issubset(corrected_profile.keys()):
+                        logger.warning(
+                            f"/correct: LLM returned invalid profile keys for {user.id} "
+                            f"(got={set(corrected_profile.keys())})"
+                        )
+                        await update.message.reply_text(
+                            "⚠️ Не удалось применить исправление — попробуй сформулировать иначе."
+                        )
+                        return
+
                     await db_service.update_user(user.id, {"profile_summary": corrected_profile})
 
                     await update.message.reply_text(
