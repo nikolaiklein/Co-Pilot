@@ -63,7 +63,8 @@ jobs:
           QDRANT_API_KEY=QDRANT_API_KEY:latest,\
           LITELLM_BASE_URL=LITELLM_BASE_URL:latest,\
           LITELLM_API_KEY=LITELLM_API_KEY:latest,\
-          GROQ_API_KEY=GROQ_API_KEY:latest"
+          GROQ_API_KEY=GROQ_API_KEY:latest,\
+          CRON_SECRET=CRON_SECRET:latest"
 
       - name: Show deployed URL
         run: |

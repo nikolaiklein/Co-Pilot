@@ -16,6 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем весь исходный код проекта в рабочую директорию контейнера
 COPY . .
 
+# Создаём непривилегированного пользователя и передаём ему /app (EC-13)
+RUN adduser --disabled-password --gecos '' appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
 # Cloud Run ожидает, что приложение будет слушать порт, указанный в переменной окружения PORT.
 # По умолчанию это 8080. Инструкция EXPOSE носит информативный характер.
 EXPOSE 8080

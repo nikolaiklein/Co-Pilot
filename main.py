@@ -2,15 +2,16 @@ import os
 import logging
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from telegram import Update
 from dotenv import load_dotenv
 from config.firebase_init import init_firebase
+from dependencies import ADMIN_USER_ID, require_cron_secret
 from services.db import DatabaseService
 from services.telegram_bot import create_bot_app
 from services.ai_engine import AIEngine
 from services.analyzer import AnalyzerService
-from services.memory import MemoryService
+from services.memory_c60 import MemoryC60Service, _fire_and_forget
 from services.model_catalog import ModelCatalog
 
 # Настройка логирования — JSON для Cloud Run, обычный для локальной разработки
@@ -79,14 +80,19 @@ async def lifespan(app: FastAPI):
         logger.error(f"Ошибка инициализации AIEngine: {e}")
         app.state.ai_engine = None
 
-    # 4. Memory Service (Mem0 + Qdrant)
+    # 4. Memory Service (C60 Fullerene + Qdrant)
     try:
         gemini_key = os.getenv("GEMINI_API_KEY")
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
         if gemini_key:
-            app.state.memory = MemoryService(gemini_key, qdrant_url, qdrant_api_key)
-            logger.info("Memory Service (Mem0) инициализирован.")
+            app.state.memory = MemoryC60Service(
+                gemini_api_key=gemini_key,
+                qdrant_url=qdrant_url,
+                qdrant_api_key=qdrant_api_key,
+                db=app.state.db,
+            )
+            logger.info("Memory Service (C60 Fullerene) инициализирован.")
         else:
             app.state.memory = None
             logger.warning("Memory Service не инициализирован (нет GEMINI_API_KEY).")
@@ -200,7 +206,7 @@ async def telegram_webhook(request: Request):
         )
 
 
-@app.post("/cron/analyze")
+@app.post("/cron/analyze", dependencies=[Depends(require_cron_secret)])
 async def analyze_user_cron(request: Request, user_id: int):
     """
     Эндпоинт для запуска анализа профиля пользователя по расписанию.
@@ -212,7 +218,7 @@ async def analyze_user_cron(request: Request, user_id: int):
     return await analyzer.analyze_user_profile(user_id)
 
 
-@app.post("/cron/analyze-all")
+@app.post("/cron/analyze-all", dependencies=[Depends(require_cron_secret)])
 async def analyze_all_users_cron(request: Request):
     """
     Эндпоинт для ежедневного анализа ВСЕХ пользователей.
@@ -251,7 +257,7 @@ async def analyze_all_users_cron(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-@app.post("/cron/weekly-digest")
+@app.post("/cron/weekly-digest", dependencies=[Depends(require_cron_secret)])
 async def send_weekly_digest(request: Request):
     """
     Эндпоинт для отправки еженедельных итогов всем пользователям.
@@ -313,16 +319,24 @@ async def send_weekly_digest(request: Request):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/debug/memory/{user_id}")
+@app.get("/debug/memory/{user_id}", dependencies=[Depends(require_cron_secret)])
 async def debug_memory(request: Request, user_id: int, q: str = ""):
     """
     Отладочный эндпоинт для проверки памяти пользователя.
     GET /debug/memory/123 — статистика
     GET /debug/memory/123?q=тема — поиск по памяти
+
+    EC-2: Protected by X-Cron-Secret. Restricted to admin user only.
     """
+    # EC-2: restrict to admin user only
+    if user_id != ADMIN_USER_ID:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(status_code=403, detail="Forbidden")
+
     memory = request.app.state.memory
     if not memory:
-        return {"status": "error", "message": "Memory Service not initialized"}
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(status_code=503, content={"status": "error", "message": "Memory Service not initialized"})
 
     try:
         all_memories = await memory.get_all_memories(user_id, limit=100)
@@ -336,16 +350,18 @@ async def debug_memory(request: Request, user_id: int, q: str = ""):
             result["search_results"] = search_results
 
         result["recent"] = [
-            {"memory": m.get("memory", "")[:200], "id": m.get("id", "")}
+            {"id": m.get("id", "")}
             for m in all_memories[:5]
         ]
 
         return result
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        logger.error(f"debug_memory error for user {user_id}: {e}")
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(status_code=500, content={"status": "error", "message": "Internal error"})
 
 
-@app.post("/cron/summarize-memory")
+@app.post("/cron/summarize-memory", dependencies=[Depends(require_cron_secret)])
 async def summarize_memory_cron(request: Request):
     """
     Суммаризация старых сообщений в долговременной памяти.
@@ -371,6 +387,50 @@ async def summarize_memory_cron(request: Request):
     except Exception as e:
         logger.error(f"Ошибка cron summarize-memory: {e}")
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/cron/dream-state", dependencies=[Depends(require_cron_secret)])
+async def dream_state_cron(request: Request):
+    """
+    AI Dream State — нightly memory consolidation.
+
+    Returns HTTP 202 immediately, then runs all three phases
+    (Weight Decay, Apoptosis, Valence Restoration) as a background task
+    for each user.
+
+    EC-2: Protected by X-Cron-Secret.
+    Task 12: Cloud Run --timeout 3600.
+    """
+    memory = request.app.state.memory
+    db = request.app.state.db
+
+    if not memory or not db:
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Services not initialized"},
+        )
+
+    async def _run_all_users():
+        from services.dream_state import run_dream_state
+        try:
+            user_ids = await db.get_all_user_ids()
+            logger.info(f"Dream State: starting for {len(user_ids)} users")
+            for uid in user_ids:
+                try:
+                    # Get Qdrant client from memory service
+                    client = await memory._ensure_qdrant()
+                    provider = await memory._ensure_c60_provider()
+                    result = await run_dream_state(uid, client, provider, db)
+                    logger.info(f"Dream State: user {uid} complete: {result}")
+                except Exception as e:
+                    logger.error(f"Dream State: user {uid} error: {e}")
+        except Exception as e:
+            logger.error(f"Dream State: batch error: {e}")
+
+    _fire_and_forget(_run_all_users())
+
+    return {"status": "accepted", "message": "Dream State started in background"}
 
 
 if __name__ == "__main__":

@@ -77,3 +77,19 @@ These must be followed — flag violations as findings.
 **Convention:** All `analyze()` methods on all providers must log the same structured metadata as `generate()`: model identifier, token usage, latency, finish_reason. No LLM call may execute without observability.
 **Origin:** Willison — Council Review 2026-03-15-0020
 **Principle:** `references/quality-llm.md` → Principle 4
+
+### EC-15: asyncio.create_task must use _fire_and_forget with GC protection
+**Convention:** All fire-and-forget background tasks must use the `_fire_and_forget` helper (or equivalent) that: (1) stores a strong reference in a module-level set, (2) adds a `done_callback` that logs exceptions and removes the task from the set. Bare `asyncio.create_task()` without a stored reference is forbidden — the GC may silently discard the task before it completes.
+**Origin:** Backend/Python Expert — Council Review 2026-04-03-2346
+**Principle:** `references/quality-backend.md` → Principle 1
+
+---
+
+## Accepted Patterns
+
+These patterns are intentional — do **not** flag as findings.
+
+### AP-1: /cron/* endpoints return HTTP 202 immediately
+**Pattern:** Cron endpoints return `{"status": "accepted"}` with HTTP 202 before the background work completes. This is required because Cloud Scheduler has a fixed request timeout and does not wait for long-running batch operations.
+**Origin:** Docker/Deploy Expert — Council Review 2026-04-03-2346
+**Note:** The fire-and-forget task itself must still use EC-15 (_fire_and_forget with GC protection).

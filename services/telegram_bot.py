@@ -2,13 +2,13 @@ import os
 import logging
 import io
 import re
-import csv
 import json
 import html
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from services.db import DatabaseService
+from services.memory_c60 import _fire_and_forget
 
 # Настройка логирования
 logger = logging.getLogger(__name__)
@@ -225,13 +225,149 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             buttons.append([InlineKeyboardButton("✅ Оставить текущую", callback_data="mswitch:keep")])
             return InlineKeyboardMarkup(buttons)
 
+        # ──────────────────────────────────────────────────────────────────────
+        # C60 UX helpers — Domain Discovery, Dream State, Migration notifications
+        # ──────────────────────────────────────────────────────────────────────
+
+        def _build_domains_page_keyboard(
+            domains: list[str], page: int, total_pages: int
+        ) -> InlineKeyboardMarkup:
+            """Paginated inline keyboard for Domain Discovery notification."""
+            buttons = []
+            start = page * 4
+            for d in domains[start:start + 4]:
+                buttons.append([InlineKeyboardButton(f"✦ {d}", callback_data="domains:ok")])
+
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("←", callback_data=f"domains:page:{page - 1}"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton("→", callback_data=f"domains:page:{page + 1}"))
+            if nav:
+                buttons.append(nav)
+            buttons.append([InlineKeyboardButton("Понятно ✓", callback_data="domains:ok")])
+            return InlineKeyboardMarkup(buttons)
+
+        def _domains_page_text(domains: list[str], page: int, total_pages: int) -> str:
+            """Card text for domain discovery notification."""
+            start = page * 4
+            domain_lines = "\n".join(
+                f"<b>{html.escape(d)}</b>" for d in domains[start:start + 4]
+            )
+            page_indicator = f"  <i>стр. {page + 1}/{total_pages}</i>" if total_pages > 1 else ""
+            return (
+                f"🔮 <b>Открыты твои личные домены памяти</b>{page_indicator}\n\n"
+                f"{domain_lines}\n\n"
+                f"<i>Эти сферы жизни теперь определяют, как я организую твою память.</i>"
+            )
+
+        async def _send_domain_notification(
+            chat_id: int, user_id: int, bot
+        ) -> None:
+            """Send Domain Discovery notification if new domains were discovered."""
+            if not db_service:
+                return
+            try:
+                # Check pentagon_domains for current version
+                pd_doc = await db_service.db.collection("pentagon_domains").document(str(user_id)).get()
+                if not pd_doc.exists:
+                    return
+                pd_data = pd_doc.to_dict() or {}
+                current_version = pd_data.get("version", 0)
+                domains = pd_data.get("domains", [])
+                if not domains or current_version == 0:
+                    return
+
+                # Check what version user has already seen
+                user_data = await db_service.get_user(user_id)
+                shown_version = (user_data or {}).get("domain_version_shown", 0)
+                if shown_version >= current_version:
+                    return  # already notified
+
+                # Send paginated notification
+                total_pages = (len(domains) + 3) // 4
+                text = _domains_page_text(domains, 0, total_pages)
+                keyboard = _build_domains_page_keyboard(domains, 0, total_pages)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+
+                # Mark as shown
+                await db_service.update_user(user_id, {"domain_version_shown": current_version})
+            except Exception as e:
+                logger.debug(f"Domain notification error for {user_id}: {e}")
+
+        async def _check_and_send_dream_summary(
+            chat_id: int, user_id: int, bot
+        ) -> None:
+            """Send Dream State summary if apoptosis > 5 bonds and not yet shown today."""
+            if not db_service:
+                return
+            try:
+                user_data = await db_service.get_user(user_id)
+                summary = (user_data or {}).get("pending_dream_summary")
+                if not summary:
+                    return
+                apoptosis_bonds = summary.get("apoptosis_bonds", 0)
+                if apoptosis_bonds < 5:
+                    await db_service.update_user(user_id, {"pending_dream_summary": None})
+                    return
+                pruned = summary.get("pruned_atoms", 0)
+                restored = summary.get("restored_bonds", 0)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🌙 ослаблено <code>{apoptosis_bonds}</code> · "
+                        f"архивировано <code>{pruned}</code> · "
+                        f"восстановлено <code>{restored}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                await db_service.update_user(user_id, {"pending_dream_summary": None})
+            except Exception as e:
+                logger.debug(f"Dream summary notification error for {user_id}: {e}")
+
+        async def _check_and_send_migration_notice(
+            chat_id: int, user_id: int, bot
+        ) -> None:
+            """Send one-time migration notification if migration was just completed."""
+            if not db_service:
+                return
+            try:
+                user_data = await db_service.get_user(user_id)
+                if not (user_data or {}).get("c60_migration_done"):
+                    return
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "✨ <b>Твоя память обновлена</b>\n\n"
+                        "Все воспоминания перенесены в C60 Fullerene Memory — "
+                        "новую архитектуру с семантическими связями между фактами.\n\n"
+                        "Используй <code>/memory</code> чтобы увидеть свои домены."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                await db_service.update_user(user_id, {"c60_migration_done": None})
+            except Exception as e:
+                logger.debug(f"Migration notice error for {user_id}: {e}")
+
+        async def _send_post_reply_notifications(
+            chat_id: int, user_id: int, bot
+        ) -> None:
+            """Fire domain / dream / migration notifications after the main reply."""
+            await _check_and_send_migration_notice(chat_id, user_id, bot)
+            await _check_and_send_dream_summary(chat_id, user_id, bot)
+            await _send_domain_notification(chat_id, user_id, bot)
+
         # Общая функция для обработки логики диалога (используется для текста и голоса)
         async def process_dialog_turn(user, chat_id, user_text, context):
             try:
                 # 0. Режим bulk-загрузки: сохраняем в память (сырой текст + факты)
                 if user.id in bulk_mode_users:
                     if memory_service:
-                        import asyncio
                         await memory_service.store_bulk(user.id, user_text)
                         bulk_mode_users[user.id] = bulk_mode_users.get(user.id, 0) + 1
                         count = bulk_mode_users[user.id]
@@ -441,9 +577,8 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                         user_messages_count = len([m for m in history if m.get('role') == 'user'])
                         if user_messages_count > 0 and user_messages_count % 3 == 0:
                             logger.info(f"Запускаем анализ профиля для {user.id} (после {user_messages_count} сообщений)")
-                            # Запускаем в фоне, не ждём результата
-                            import asyncio
-                            asyncio.create_task(analyzer_service.analyze_user_profile(user.id))
+                            # Запускаем в фоне с GC-защитой (EC-15)
+                            _fire_and_forget(analyzer_service.analyze_user_profile(user.id))
                     except Exception as analyzer_error:
                         logger.warning(f"Не удалось запустить анализ профиля: {analyzer_error}")
 
@@ -472,6 +607,9 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                         # Если не удалось отправить с HTML, отправляем без форматирования
                         logger.warning(f"Ошибка отправки с HTML: {send_error}, отправляем без форматирования")
                         await context.bot.send_message(chat_id=chat_id, text=response_text[:4096])
+
+                # Post-reply: domain discovery, dream state, migration notifications (EC-15)
+                _fire_and_forget(_send_post_reply_notifications(chat_id, user.id, context.bot))
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке диалога с {user.id}: {e}")
@@ -670,9 +808,6 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
         # Регистрируем обработчик команды /name
         application.add_handler(CommandHandler("name", handle_name))
 
-        # Регистрируем обработчик команды /help
-        application.add_handler(CommandHandler("help", handle_help))
-
         async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """
             Обрабатывает команду /clear — очищает историю диалога.
@@ -844,7 +979,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         async def _build_categories_keyboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             """Строит клавиатуру категорий моделей (первый экран /model)."""
-            from services.model_catalog import get_model_meta, MODEL_HINTS, FAMILY_ORDER, GEMINI_MODELS, NVIDIA_MODELS
+            from services.model_catalog import get_model_meta, FAMILY_ORDER, GEMINI_MODELS, NVIDIA_MODELS
 
             current = await _get_current_model(user_id)
 
@@ -939,7 +1074,6 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
             from services.ai_engine import (
                 OPENAI_COMPATIBLE_PROVIDERS, PROVIDER_MAP, parse_model_string,
             )
-            from services.model_catalog import DEFAULT_MODELS, NVIDIA_MODELS, GEMINI_MODELS
             user = update.effective_user
             if not is_authorized(user.id):
                 return
@@ -1033,29 +1167,87 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     text += f"{i}. 🧠 (score: {score:.2f}) {content_preview}\n\n"
 
                 await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-            else:
-                # Статистика памяти (через Mem0 API)
+
+            elif args and args[0] == "refresh":
+                # /memory refresh — EC-5: confirm before re-running domain discovery
                 try:
                     all_memories = await memory_service.get_all_memories(user.id, limit=500)
                     total = len(all_memories)
+                except Exception:
+                    total = 0
+                confirm_text = (
+                    f"🔄 <b>Обновить домены памяти?</b>\n\n"
+                    f"<code>{total}</code> воспоминаний будут переклассифицированы по новым доменам.\n\n"
+                    "<i>Это займёт некоторое время в фоновом режиме.</i>"
+                )
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Подтвердить", callback_data="mem_refresh:confirm"),
+                        InlineKeyboardButton("❌ Отмена", callback_data="mem_refresh:cancel"),
+                    ]
+                ])
+                await update.message.reply_text(confirm_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
-                    text = f"""🧠 <b>Долговременная память (Mem0)</b>
+            else:
+                # Статистика памяти C60
+                try:
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+                    all_memories = await memory_service.get_all_memories(user.id, limit=500)
+                    total = len(all_memories)
 
-📊 <b>Статистика:</b>
-  Извлечённых фактов: {total}
+                    # Check if C60 memory (atoms have pentagon_domain)
+                    is_c60 = total > 0 and "pentagon_domain" in (all_memories[0] or {})
 
-💡 <b>Команды:</b>
-  <code>/memory search запрос</code> — поиск по памяти
+                    if is_c60:
+                        # Compute domain stats
+                        domain_counts: dict[str, int] = {}
+                        domain_bonds: dict[str, int] = {}
+                        for atom in all_memories:
+                            domain = atom.get("pentagon_domain", "Общее")
+                            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+                            bonds = atom.get("covalent_bonds", []) or []
+                            domain_bonds[domain] = domain_bonds.get(domain, 0) + len(bonds)
 
-ℹ️ Mem0 автоматически извлекает факты из каждого разговора, дедуплицирует и обновляет существующие.
-Поиск по памяти происходит при каждом сообщении — триггерные слова не нужны."""
+                        # Sort by atom count desc, take top 5
+                        top_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)
+                        total_bonds = sum(domain_bonds.values())
 
-                    # Показать последние 5 фактов
-                    if all_memories:
-                        text += "\n\n📝 <b>Последние факты:</b>\n"
-                        for m in all_memories[:5]:
-                            memory_text = m.get("memory", "")[:150]
-                            text += f"  • {memory_text}\n"
+                        # Build C60 stats card
+                        text = "🧠 <b>C60 Fullerene Memory</b>\n\n"
+                        text += f"📊 Атомов: <b>{total}</b> · Связей: <b>{total_bonds}</b>\n\n"
+
+                        for i, (domain, count) in enumerate(top_domains[:5], 1):
+                            bonds = domain_bonds.get(domain, 0)
+                            pct = round(bonds / total_bonds * 100) if total_bonds else 0
+                            text += f"<b>{html.escape(domain)}</b> · {count} атомов · {pct}% бондов\n"
+
+                        remaining = len(top_domains) - 5
+                        if remaining > 0:
+                            _rem_word = "домен" if remaining == 1 else "доменов"
+                            text += f"\n<i>и ещё {remaining} {_rem_word}</i>\n"
+
+                        # Dream State last run
+                        if db_service:
+                            try:
+                                user_data = await db_service.get_user(user.id)
+                                last_dream = (user_data or {}).get("dream_state_last_run")
+                                if last_dream:
+                                    text += f"\n🌙 Dream State: <code>{last_dream[:10]}</code>"
+                            except Exception:
+                                pass
+
+                        text += "\n\n💡 <code>/memory search запрос</code> — поиск по памяти"
+                        text += "\n💡 <code>/memory refresh</code> — обновить домены"
+
+                    else:
+                        # Fallback: old Mem0 format
+                        text = f"🧠 <b>Долговременная память</b>\n\n📊 Фактов: {total}\n\n"
+                        text += "💡 <code>/memory search запрос</code> — поиск по памяти"
+                        if all_memories:
+                            text += "\n\n📝 <b>Последние факты:</b>\n"
+                            for m in all_memories[:5]:
+                                memory_text = m.get("memory", m.get("vector_core", ""))[:150]
+                                text += f"  • {memory_text}\n"
 
                     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
                 except Exception as e:
@@ -1248,7 +1440,7 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     return
 
                 try:
-                    doc_id = await db_service.vault_save(
+                    await db_service.vault_save(
                         user.id, title, last_assistant, item_type="note"
                     )
                     preview = last_assistant[:100] + "..." if len(last_assistant) > 100 else last_assistant
@@ -1420,7 +1612,6 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 if user.id in bulk_mode_users:
                     # Bulk-режим: сохраняем в память напрямую
                     if memory_service:
-                        import asyncio
                         # Разбиваем длинные тексты на чанки по ~1500 символов
                         chunks = _split_text_to_chunks(text, max_len=1500)
                         for chunk in chunks:
@@ -1862,6 +2053,77 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                         await query.message.edit_text("👌 Не сохраняю.")
                     except Exception:
                         pass
+
+            # --- Domain Discovery pagination callbacks ---
+            elif data.startswith("domains:"):
+                parts = data.split(":", 2)
+                action = parts[1] if len(parts) > 1 else ""
+
+                if action == "ok":
+                    try:
+                        await query.message.edit_text(
+                            "✦ <i>Домены сохранены</i>", parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+
+                elif action == "page":
+                    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                    try:
+                        pd_doc = await db_service.db.collection("pentagon_domains").document(str(user.id)).get()
+                        domains = (pd_doc.to_dict() or {}).get("domains", []) if pd_doc.exists else []
+                        if domains:
+                            total_pages = (len(domains) + 3) // 4
+                            page = max(0, min(page, total_pages - 1))
+                            text = _domains_page_text(domains, page, total_pages)
+                            keyboard = _build_domains_page_keyboard(domains, page, total_pages)
+                            try:
+                                await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.debug(f"domains:page callback error: {e}")
+
+            # --- Memory refresh confirmation callbacks ---
+            elif data.startswith("mem_refresh:"):
+                choice = data[12:]  # after "mem_refresh:"
+
+                if choice == "cancel":
+                    try:
+                        await query.message.edit_text("👌 Обновление отменено.", parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+
+                elif choice == "confirm":
+                    try:
+                        await query.message.edit_text(
+                            "🔄 <i>Запускаю обновление доменов в фоне…</i>", parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
+                    # Trigger domain re-discovery in background
+                    if db_service:
+                        try:
+                            from services.domain_discovery import discover_domains
+                            from services.ai_engine import create_provider as _create_provider
+                            import os as _os
+                            _gemini_key = _os.getenv("GEMINI_API_KEY", "")
+                            if _gemini_key:
+                                _ai = _create_provider("gemini", "gemini-2.0-flash")
+                                # Count atoms for threshold
+                                _atom_count = 10  # at least trigger threshold
+                                if memory_service:
+                                    try:
+                                        _atoms = await memory_service.get_all_memories(user.id, limit=1)
+                                        _atom_count = max(10, len(_atoms))
+                                    except Exception:
+                                        pass
+                                import asyncio as _asyncio
+                                _asyncio.create_task(
+                                    discover_domains(user.id, _atom_count, _ai, db_service)
+                                )
+                        except Exception as e:
+                            logger.warning(f"mem_refresh trigger error for {user.id}: {e}")
 
         # Регистрируем обработчик callback query (inline кнопки)
         application.add_handler(CallbackQueryHandler(handle_callback))
