@@ -810,17 +810,20 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
 
         async def handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """
-            Обрабатывает команду /clear — очищает историю диалога.
+            Обрабатывает команду /clear — запрашивает подтверждение перед очисткой.
+            UX P1: необратимая операция требует явного подтверждения.
             """
             user = update.effective_user
             logger.info(f"Команда /clear от {user.id}")
-            
-            try:
-                count = await db_service.clear_messages(user.id)
-                await update.message.reply_text(f"✅ История очищена! Удалено сообщений: {count}")
-            except Exception as e:
-                logger.error(f"Ошибка очистки истории для {user.id}: {e}")
-                await update.message.reply_text("❌ Не удалось очистить историю.")
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Да, очистить", callback_data="confirm_clear"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear"),
+            ]])
+            await update.message.reply_text(
+                "⚠️ <b>Очистить историю диалога?</b>\n\nЭто удалит все сообщения. Действие необратимо.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
 
         # Регистрируем обработчик команды /clear
         application.add_handler(CommandHandler("clear", handle_clear))
@@ -1741,6 +1744,18 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                     "💬 Отлично! Просто пиши мне о чём угодно.\n\n"
                     "Я буду постепенно узнавать тебя из наших диалогов. Начинай! 🚀"
                 )
+
+            # --- /clear confirmation ---
+            elif data == "confirm_clear":
+                try:
+                    count = await db_service.clear_messages(user.id)
+                    await query.message.edit_text(f"✅ История очищена. Удалено сообщений: {count}")
+                except Exception as e:
+                    logger.error(f"Ошибка очистки истории для {user.id}: {e}")
+                    await query.message.edit_text("❌ Не удалось очистить историю.")
+
+            elif data == "cancel_clear":
+                await query.message.edit_text("Отмена. История не тронута.")
 
             # --- Model selection callbacks ---
             elif data.startswith("mc:") or data == "mback" or data.startswith("ms:"):

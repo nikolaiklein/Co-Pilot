@@ -1,3 +1,4 @@
+import hmac
 import os
 import logging
 import sys
@@ -185,6 +186,17 @@ async def telegram_webhook(request: Request):
     """
     Эндпоинт для получения обновлений от Telegram (Webhook).
     """
+    # Hunt P1 fix #1 (EC-9): verify Telegram webhook secret token.
+    # WEBHOOK_SECRET must be set both here and in setWebhook?secret_token=...
+    # If env var is absent (dev/CI), check is skipped for backward compatibility.
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "")
+    if webhook_secret:
+        incoming = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(incoming, webhook_secret):
+            logger.warning("Webhook: rejected — invalid or missing secret token")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=403, content={"status": "forbidden"})
+
     bot_app = request.app.state.bot_app
     if not bot_app:
         logger.error("Bot Application не инициализировано. Игнорируем апдейт.")

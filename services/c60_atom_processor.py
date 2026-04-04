@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
-from services.c60_models import C60Atom
+from services.c60_models import C60Atom, _DOMAIN_RE
 
 if TYPE_CHECKING:
     from services.ai_engine import BaseProvider
@@ -257,6 +257,17 @@ async def process_message(
     # Normalise bond last_activated timestamps
     for bond in data.get("covalent_bonds", []):
         bond.setdefault("last_activated", now_utc)
+
+    # Brandur P1 fix #6: assert pentagon_domain is from the user's domain list.
+    # Only clamp syntactically-valid domains that are not in user_domains.
+    # Syntactically-invalid domains (emoji, etc.) are left for Pydantic to reject → None.
+    llm_domain = data.get("pentagon_domain", "")
+    if user_domains and llm_domain not in user_domains and _DOMAIN_RE.match(str(llm_domain)):
+        logger.warning(
+            f"C60 Topology Engine: LLM returned unknown domain {llm_domain!r} "
+            f"— clamping to 'Общее' (valid={user_domains[:3]}…)"
+        )
+        data["pentagon_domain"] = "Общее"
 
     # EC-9: validate against C60Atom schema — any deviation → None
     try:

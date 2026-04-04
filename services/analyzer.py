@@ -88,8 +88,22 @@ class AnalyzerService:
             try:
                 profile_data = json.loads(analysis_json_str)
             except json.JSONDecodeError:
-                logger.warning("Не удалось распарсить JSON ответа анализатора. Сохраняем как текст.")
-                profile_data = {"raw_analysis": analysis_json_str}
+                # Hunt/Backend P1 fix #3: never write raw LLM text into profile_summary —
+                # that would overwrite structured fields with {"raw_analysis": "..."}.
+                logger.warning(
+                    f"Analyzer: JSON parse failed for {user_id} — skipping profile update "
+                    f"(raw_len={len(analysis_json_str)})"
+                )
+                return {"status": "error", "reason": "json_parse_failed"}
+
+            # Validate required keys before overwriting — guard against partial/wrong LLM responses
+            required_keys = {"new_skills", "interests", "pain_points", "dreams", "summary"}
+            if not required_keys.issubset(profile_data.keys()):
+                logger.warning(
+                    f"Analyzer: response missing required keys for {user_id} "
+                    f"(got={set(profile_data.keys())}) — skipping profile update"
+                )
+                return {"status": "error", "reason": "missing_required_keys"}
 
             # Обновляем профиль в документе пользователя
             await self.db_service.update_user(user_id, {"profile_summary": profile_data})
