@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 # Collection for C60 atoms — separate from legacy copilot_memory
 C60_COLLECTION = "copilot_c60_memory"
 
-# Gemini embedding-001 output dimension
-VECTOR_SIZE = 768
+# gemini-embedding-001 output dimension (3072-dim, released 2025)
+VECTOR_SIZE = 3072
 
 # UUID5 namespace for deterministic Qdrant point IDs
 _UUID5_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_URL

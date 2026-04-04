@@ -66,7 +66,7 @@ def _fire_and_forget(coro) -> asyncio.Task:
 
 _MEM0_AVAILABLE = False
 try:
-    from mem0 import AsyncMemory
+    from mem0 import AsyncMemory  # noqa: F401
     _MEM0_AVAILABLE = True
 except ImportError:
     pass
@@ -540,17 +540,18 @@ class MemoryC60Service:
             if query_vector is None:
                 return []
 
-            # 2. Vector search top-5
-            search_results = await asyncio.wait_for(
-                client.search(
+            # 2. Vector search top-5 (qdrant-client ≥1.13: query_points replaces search)
+            result = await asyncio.wait_for(
+                client.query_points(
                     collection_name=C60_COLLECTION,
-                    query_vector=query_vector,
+                    query=query_vector,
                     query_filter=build_user_filter(user_id),
                     limit=5,
                     with_payload=True,
                 ),
                 timeout=30.0,
             )
+            search_results = result.points
 
             if not search_results:
                 return []
@@ -645,7 +646,6 @@ class MemoryC60Service:
         if not results:
             return ""
 
-        relevant = [r for r in results if r.get("score", 0) >= 0.2 or r.get("score", 0) == 0.0]
         # 0.0 score = bond neighbors, always included if they exist
         # Only filter out low-score direct hits
         filtered = []
