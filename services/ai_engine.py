@@ -530,6 +530,11 @@ OPENAI_COMPATIBLE_PROVIDERS = {
         "base_url": "https://integrate.api.nvidia.com/v1",
         "default_model": "meta/llama-4-maverick-17b-128e-instruct",
     },
+    "groq": {
+        "env_key": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+    },
     "litellm": {
         "env_key": "LITELLM_API_KEY",
         "base_url": os.getenv("LITELLM_BASE_URL", ""),
@@ -758,10 +763,10 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return None
 
-    # Ротация моделей для анализа профиля: Gemini первый (надёжный), NVIDIA как бонус
+    # Ротация моделей для анализа профиля: Groq первый (быстрый), Gemini как fallback
     ANALYZER_MODELS = [
+        ("groq", "llama-3.3-70b-versatile"),
         ("gemini", "gemini-2.0-flash"),
-        ("nvidia", "deepseek-ai/deepseek-v3.2"),
         ("nvidia", "moonshotai/kimi-k2-instruct"),
     ]
 
