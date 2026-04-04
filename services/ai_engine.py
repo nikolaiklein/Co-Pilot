@@ -766,17 +766,25 @@ class AIEngine:
     ]
 
     async def analyze_content(self, prompt: str) -> str:
-        """Анализирует контент через бесплатные NVIDIA NIM модели с ротацией. Не зависит от выбора пользователя."""
+        """Анализирует контент через NVIDIA NIM модели с ротацией, Gemini как fallback."""
         for model in self.ANALYZER_MODELS:
             try:
                 provider = self.get_provider("nvidia", model)
-                result = await provider.analyze(prompt)
+                result = await asyncio.wait_for(provider.analyze(prompt), timeout=25.0)
                 logger.info(f"Анализ профиля выполнен через {model}")
                 return result
             except Exception as e:
                 logger.warning(f"Анализ через {model} не удался: {e}")
                 continue
-        logger.error("Все NVIDIA модели для анализа недоступны")
+        # Gemini fallback — надёжный, всегда работает
+        try:
+            provider = self.get_provider("gemini", "gemini-2.0-flash")
+            result = await asyncio.wait_for(provider.analyze(prompt), timeout=30.0)
+            logger.info("Анализ профиля выполнен через gemini-2.0-flash (fallback)")
+            return result
+        except Exception as e:
+            logger.error(f"Gemini fallback анализа не удался: {e}")
+        logger.error("Все модели для анализа недоступны")
         return "[Ошибка анализа]"
 
     async def analyze_image(
