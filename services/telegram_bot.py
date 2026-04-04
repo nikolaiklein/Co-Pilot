@@ -882,8 +882,24 @@ async def create_bot_app(db_service: DatabaseService, ai_engine, analyzer_servic
                 else:
                     text += str(profile)
                 
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-                
+                # Telegram limit: 4096 chars. Split if needed.
+                MAX_LEN = 4000
+                if len(text) <= MAX_LEN:
+                    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+                else:
+                    # Send in chunks, splitting on newlines
+                    parts, chunk = [], ""
+                    for line in text.splitlines(keepends=True):
+                        if len(chunk) + len(line) > MAX_LEN:
+                            parts.append(chunk)
+                            chunk = line
+                        else:
+                            chunk += line
+                    if chunk:
+                        parts.append(chunk)
+                    for part in parts:
+                        await update.message.reply_text(part, parse_mode=ParseMode.HTML)
+
             except Exception as e:
                 logger.error(f"Ошибка получения профиля для {user.id}: {e}")
                 await update.message.reply_text("❌ Не удалось загрузить профиль.")
