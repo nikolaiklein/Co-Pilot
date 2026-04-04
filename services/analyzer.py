@@ -75,8 +75,13 @@ class AnalyzerService:
             # 4. Отправляем запрос в AI
             analysis_json_str = await self.ai_engine.analyze_content(prompt)
 
-            # Попытаемся очистить ответ, если Gemini все же добавит markdown
+            # Извлекаем JSON из ответа: убираем markdown-обёртки и текст вне {}
             analysis_json_str = analysis_json_str.replace("```json", "").replace("```", "").strip()
+            # Если Gemini добавил текст до/после JSON — берём только блок { ... }
+            json_start = analysis_json_str.find("{")
+            json_end = analysis_json_str.rfind("}")
+            if json_start != -1 and json_end != -1 and json_end > json_start:
+                analysis_json_str = analysis_json_str[json_start:json_end + 1]
 
             # 5. Сохраняем результат
             # Можно сохранить как строку или попытаться распарсить, если нужно работать как с объектом.
