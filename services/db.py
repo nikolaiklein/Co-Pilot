@@ -189,9 +189,8 @@ class DatabaseService:
 
         try:
             reports_ref = self.db.collection('users').document(str(user_id)).collection('reports')
-            # Добавляем timestamp сервера
-            report_data['timestamp'] = firestore.SERVER_TIMESTAMP
-            await reports_ref.add(report_data)
+            # Добавляем timestamp сервера (копия чтобы не мутировать входной dict)
+            await reports_ref.add({**report_data, 'timestamp': firestore.SERVER_TIMESTAMP})
             logger.info(f"Отчет для пользователя {user_id} сохранен.")
         except Exception as e:
             logger.error(f"Ошибка при сохранении отчета для {user_id}: {e}")
