@@ -1,9 +1,11 @@
 import hmac
+import json
 import os
 import logging
 import sys
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
 from telegram import Update
 from dotenv import load_dotenv
 from config.firebase_init import init_firebase
@@ -230,7 +232,9 @@ async def analyze_user_cron(request: Request, user_id: int):
     if not analyzer:
         return {"status": "error", "message": "Analyzer Service not initialized"}
 
-    return await analyzer.analyze_user_profile(user_id)
+    result = await analyzer.analyze_user_profile(user_id)
+    # Explicit JSON round-trip to avoid Pydantic v2 sentinel serialization errors
+    return JSONResponse(content=json.loads(json.dumps(result, default=str)))
 
 
 @app.post("/cron/analyze-all", dependencies=[Depends(require_cron_secret)])
