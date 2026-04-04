@@ -758,32 +758,25 @@ class AIEngine:
             logger.error(f"Ошибка при транскрибации аудио: {e}")
             return None
 
-    # Ротация бесплатных NVIDIA моделей для анализа профиля (дешёвые/быстрые первыми)
+    # Ротация моделей для анализа профиля: Gemini первый (надёжный), NVIDIA как бонус
     ANALYZER_MODELS = [
-        "deepseek-ai/deepseek-v3.2",
-        "moonshotai/kimi-k2-instruct",
-        "meta/llama-4-maverick-17b-128e-instruct",
+        ("gemini", "gemini-2.0-flash"),
+        ("nvidia", "deepseek-ai/deepseek-v3.2"),
+        ("nvidia", "moonshotai/kimi-k2-instruct"),
     ]
 
     async def analyze_content(self, prompt: str) -> str:
-        """Анализирует контент через NVIDIA NIM модели с ротацией, Gemini как fallback."""
-        for model in self.ANALYZER_MODELS:
+        """Анализирует контент с ротацией: Gemini первый, NVIDIA если Gemini недоступен."""
+        for provider_name, model in self.ANALYZER_MODELS:
             try:
-                provider = self.get_provider("nvidia", model)
-                result = await asyncio.wait_for(provider.analyze(prompt), timeout=25.0)
-                logger.info(f"Анализ профиля выполнен через {model}")
+                provider = self.get_provider(provider_name, model)
+                timeout = 30.0 if provider_name == "gemini" else 15.0
+                result = await asyncio.wait_for(provider.analyze(prompt), timeout=timeout)
+                logger.info(f"Анализ профиля выполнен через {provider_name}/{model}")
                 return result
             except Exception as e:
-                logger.warning(f"Анализ через {model} не удался: {e}")
+                logger.warning(f"Анализ через {provider_name}/{model} не удался: {e}")
                 continue
-        # Gemini fallback — надёжный, всегда работает
-        try:
-            provider = self.get_provider("gemini", "gemini-2.0-flash")
-            result = await asyncio.wait_for(provider.analyze(prompt), timeout=30.0)
-            logger.info("Анализ профиля выполнен через gemini-2.0-flash (fallback)")
-            return result
-        except Exception as e:
-            logger.error(f"Gemini fallback анализа не удался: {e}")
         logger.error("Все модели для анализа недоступны")
         return "[Ошибка анализа]"
 
